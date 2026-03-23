@@ -409,9 +409,69 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
     result.section_a_total = len(a_details)
     result.section_a_details = a_details
 
-    # If Section A fails hard (< 4 passes), immediate PASS
-    hard_fails = [not a1, not a2, not a3]  # A1, A2, A3 are hard gates
-    if any(hard_fails) or not a5:
+    # Track Section A hard gate failures (verdict determined at the end)
+    section_a_hard_fail = any([not a1, not a2, not a3]) or not a5
+
+    # ── Section B (8 quality checks) ────────────────────────────────────────
+    b_details = []
+    c = atm_straddle
+
+    if c is not None:
+        # B1: IV < 55%
+        b1 = c.iv < IV_MAX if c.iv > 0 else True
+        b_details.append(("B1: IV < 55%", b1, f"IV = {c.iv:.1f}%"))
+
+        # B2: IV-RV spread
+        b2 = snapshot.iv_rv_spread > IV_RV_CAUTION
+        b_details.append(("B2: IV-RV spread > -10", b2,
+                           f"IV-RV = {snapshot.iv_rv_spread:+.1f} (IV={snapshot.implied_vol:.0f}% RV={snapshot.realised_vol:.0f}%)"))
+
+        # B3: |Delta| < 0.15
+        b3 = abs(c.delta) < DELTA_MAX
+        b_details.append(("B3: |Delta| < 0.15", b3, f"Δ = {c.delta:.3f}"))
+
+        # B4: Theta/Price > 2.5%/hr
+        b4 = c.theta_ratio > THETA_RATIO_MIN
+        b_details.append(("B4: Theta/price > 2.5%/hr", b4,
+                           f"{c.theta_ratio * 100:.2f}%/hr (${c.theta_per_hour:.1f}/hr on ${c.price:.0f})"))
+
+        # B5: Vega < 18
+        b5 = c.vega < VEGA_MAX
+        b_details.append(("B5: Vega < 18", b5, f"Vega = {c.vega:.2f}"))
+
+        # B6: Volume at target strike (want > $1M volume as liquidity signal)
+        b6 = c.volume_24h > 1_000_000
+        b_details.append(("B6: Adequate volume", b6,
+                           f"${c.volume_24h / 1e6:.2f}M 24h vol"))
+
+        # B7: BTC flat last 60min (approximated by 4hr move < $400 for this check)
+        b7 = snapshot.btc_4h_move < 400
+        b_details.append(("B7: BTC relatively flat", b7,
+                           f"${snapshot.btc_4h_move:.0f} 4hr move"))
+
+        # B8: Max Pain proximity (within $2,000)
+        b8 = result.max_pain_gap < MAX_PAIN_BAD_GAP
+        pain_dir = "above" if snapshot.max_pain > snapshot.btc_spot else "below"
+        b_details.append(("B8: Max Pain within $2,000", b8,
+                           f"Max Pain ${snapshot.max_pain:.0f} (${result.max_pain_gap:.0f} {pain_dir} BTC)"))
+    else:
+        # No valid straddle candidate — mark all B checks as N/A
+        b3 = b4 = b8 = False
+        for label in [
+            "B1: IV < 55%", "B2: IV-RV spread > -10", "B3: |Delta| < 0.15",
+            "B4: Theta/price > 2.5%/hr", "B5: Vega < 18", "B6: Adequate volume",
+            "B7: BTC relatively flat", "B8: Max Pain within $2,000",
+        ]:
+            b_details.append((label, False, "N/A — no valid straddle in chain"))
+
+    result.section_b_pass = sum(1 for _, p, _ in b_details if p)
+    result.section_b_total = len(b_details)
+    result.section_b_details = b_details
+
+    # ── Final Verdict ────────────────────────────────────────────────────────
+
+    # Section A hard gates override everything
+    if section_a_hard_fail:
         failures = []
         if not a1:
             failures.append(f"time window ({snapshot.hours_to_expiry:.1f}hrs)")
@@ -421,60 +481,12 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
             failures.append(f"24h range (${snapshot.btc_24h_range:.0f})")
         if not a5:
             failures.append("no neutral delta strike")
-
         result.verdict = "PASS"
         result.confidence = "HIGH"
         result.summary = f"🚫 Section A hard fail: {', '.join(failures)}"
         return result
 
-    # ── Section B (8 quality checks) ────────────────────────────────────────
-    b_details = []
-    c = atm_straddle
-
-    # B1: IV < 55%
-    b1 = c.iv < IV_MAX if c.iv > 0 else True  # pass if IV not available
-    b_details.append(("B1: IV < 55%", b1, f"IV = {c.iv:.1f}%"))
-
-    # B2: IV-RV spread
-    b2 = snapshot.iv_rv_spread > IV_RV_CAUTION  # > -10 acceptable
-    b_details.append(("B2: IV-RV spread > -10", b2,
-                       f"IV-RV = {snapshot.iv_rv_spread:+.1f} (IV={snapshot.implied_vol:.0f}% RV={snapshot.realised_vol:.0f}%)"))
-
-    # B3: |Delta| < 0.15
-    b3 = abs(c.delta) < DELTA_MAX
-    b_details.append(("B3: |Delta| < 0.15", b3, f"Δ = {c.delta:.3f}"))
-
-    # B4: Theta/Price > 2.5%/hr
-    b4 = c.theta_ratio > THETA_RATIO_MIN
-    b_details.append(("B4: Theta/price > 2.5%/hr", b4,
-                       f"{c.theta_ratio * 100:.2f}%/hr (${c.theta_per_hour:.1f}/hr on ${c.price:.0f})"))
-
-    # B5: Vega < 18
-    b5 = c.vega < VEGA_MAX
-    b_details.append(("B5: Vega < 18", b5, f"Vega = {c.vega:.2f}"))
-
-    # B6: Volume at target strike (want > $1M volume as liquidity signal)
-    b6 = c.volume_24h > 1_000_000
-    b_details.append(("B6: Adequate volume", b6,
-                       f"${c.volume_24h / 1e6:.2f}M 24h vol"))
-
-    # B7: BTC flat last 60min (approximated by 4hr move < $400 for this check)
-    b7 = snapshot.btc_4h_move < 400
-    b_details.append(("B7: BTC relatively flat", b7,
-                       f"${snapshot.btc_4h_move:.0f} 4hr move"))
-
-    # B8: Max Pain proximity (within $2,000)
-    b8 = result.max_pain_gap < MAX_PAIN_BAD_GAP
-    pain_dir = "above" if snapshot.max_pain > snapshot.btc_spot else "below"
-    b_details.append(("B8: Max Pain within $2,000", b8,
-                       f"Max Pain ${snapshot.max_pain:.0f} (${result.max_pain_gap:.0f} {pain_dir} BTC)"))
-
-    result.section_b_pass = sum(1 for _, p, _ in b_details if p)
-    result.section_b_total = len(b_details)
-    result.section_b_details = b_details
-
-    # ── Final Verdict ────────────────────────────────────────────────────────
-    # B3 and B4 are non-negotiable
+    # B3 (delta) and B4 (theta) individually veto
     if not b3:
         result.verdict = "PASS"
         result.confidence = "HIGH"
