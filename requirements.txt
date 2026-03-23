@@ -1,0 +1,7 @@
+python-telegram-bot==21.6
+apscheduler==3.10.4
+httpx>=0.25.2,<0.28.0
+python-dotenv==1.0.0
+pytz==2024.1
+pandas==2.2.0
+numpy==1.26.4

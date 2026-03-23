@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: straddle-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python src/bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL_ID
+        sync: false
+      - key: TZ
+        value: Asia/Kolkata
+      - key: ENTRY_WINDOW_START
+        value: "11"
+      - key: ENTRY_WINDOW_END
+        value: "13"
+      - key: MONITOR_INTERVAL_MINUTES
+        value: "10"
+      - key: HARD_EXIT_HOUR
+        value: "16"
+      - key: HARD_EXIT_MINUTE
+        value: "30"
