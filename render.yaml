@@ -3,7 +3,7 @@ services:
     name: straddle-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python src/bot.py
+    startCommand: python bot.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false

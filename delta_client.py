@@ -218,30 +218,12 @@ class DeltaClient:
         secs = resolution_seconds.get(resolution, 3600)
         start_ts = now_ts - (secs * count)
 
-        # Delta India perpetual symbols to try in order; "BTCUSD" is the index
-        # ticker but the candles endpoint needs the perp contract symbol.
-        symbols_to_try = ["BTCUSDT", "BTCUSD_PERP", "BTC_PERP", "BTCUSD"]
-        data = None
-        last_error = None
-        for sym in symbols_to_try:
-            try:
-                data = await self._get("/v2/history/candles", params={
-                    "resolution": secs,
-                    "symbol": sym,
-                    "start": str(start_ts),
-                    "end": str(now_ts),
-                })
-                if data.get("result"):
-                    logger.info(f"Candles fetched using symbol: {sym}")
-                    break
-                data = None  # got a response but no result, try next
-            except Exception as e:
-                last_error = e
-                logger.debug(f"Candles symbol {sym} failed: {e}")
-                data = None
-                continue
-        if data is None:
-            raise last_error or RuntimeError("No valid candle symbol found")
+        data = await self._get("/v2/history/candles", params={
+            "resolution": resolution,   # API expects string e.g. "1h", "5m"
+            "symbol": "BTCUSD",
+            "start": str(start_ts),
+            "end": str(now_ts),
+        })
 
         candles = data.get("result", [])
         if not candles:
