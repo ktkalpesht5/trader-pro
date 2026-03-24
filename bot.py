@@ -87,6 +87,9 @@ class BotState:
         self.sl_target: float = 0.0
         self.entry_time: Optional[datetime] = None
 
+        # TP override — set by /tp command (e.g. /tp 30 sets 30% decay target)
+        self.tp_pct_override: Optional[float] = None
+
         # Last known market data (for commands like /status)
         self.last_snapshot: Optional[MarketSnapshot] = None
 
@@ -391,10 +394,13 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = symbol.split("-")
         strike = float(parts[2]) if len(parts) >= 3 else 0.0
 
-        # Set TP/SL — use weekend sizing if applicable
+        # Set TP/SL — use override if set, else weekend/weekday defaults
         now_ist = datetime.now(IST)
         is_weekend = now_ist.weekday() in (5, 6)
-        tp_pct = 0.40 if is_weekend else 0.50
+        if state.tp_pct_override is not None:
+            tp_pct = state.tp_pct_override / 100
+        else:
+            tp_pct = 0.40 if is_weekend else 0.50
 
         state.position_active = True
         state.entry_price = price
@@ -432,6 +438,46 @@ async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Position `{state.entry_symbol}` cleared\\. Monitoring stopped\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
+
+
+async def cmd_tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set a custom TP decay target. Usage: /tp 30  or  /tp reset"""
+    args = context.args
+    if not args:
+        current = f"{state.tp_pct_override:.0f}%" if state.tp_pct_override is not None else "default (50% weekday / 40% weekend)"
+        await update.message.reply_text(
+            f"Current TP target: {current}\n\nUsage: `/tp 30` to set 30% decay\\.\n`/tp reset` to restore default\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    if args[0].lower() == "reset":
+        state.tp_pct_override = None
+        await update.message.reply_text(
+            "✅ TP target reset to default \\(50% weekday / 40% weekend\\)\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    try:
+        pct = float(args[0])
+        if not (5 <= pct <= 95):
+            await update.message.reply_text("❌ TP% must be between 5 and 95.")
+            return
+        state.tp_pct_override = pct
+
+        # Recalculate TP for active position if one exists
+        recalc_msg = ""
+        if state.position_active:
+            state.tp_target = round(state.entry_price * (1 - pct / 100))
+            recalc_msg = f"\nActive position TP updated to \\$`{state.tp_target:,.0f}`\\."
+
+        await update.message.reply_text(
+            f"✅ TP target set to *{pct:.0f}%* decay\\." + recalc_msg,
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Invalid value. Usage: `/tp 30` or `/tp reset`")
 
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -534,6 +580,7 @@ def main():
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("entry", cmd_entry))
     app.add_handler(CommandHandler("exit", cmd_exit))
+    app.add_handler(CommandHandler("tp", cmd_tp))
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("resume", cmd_resume))
 
