@@ -33,6 +33,7 @@ from analysis_engine import (
     MarketSnapshot,
     run_pretrade_checklist,
     monitor_position,
+    find_best_strike,
     calculate_pcr_and_max_pain,
     calculate_realised_vol,
     calculate_implied_vol_from_straddle,
@@ -41,6 +42,7 @@ from formatter import (
     format_hourly_snapshot,
     format_pretrade_report,
     format_monitor_alert,
+    format_noon_signal,
     format_skip_notification,
     format_startup_message,
     format_error,
@@ -246,7 +248,8 @@ async def job_hourly_scan(bot: Bot):
         await send_message(bot, format_error("hourly scan", "Failed to fetch market data"))
         return
 
-    msg = format_hourly_snapshot(snapshot)
+    checklist_result = run_pretrade_checklist(snapshot)
+    msg = format_hourly_snapshot(snapshot, checklist_result)
     await send_message(bot, msg)
 
 
@@ -349,6 +352,32 @@ async def job_monitor_position(bot: Bot):
         logger.info(f"Position auto-cleared: {alert.action} — {alert.reason}")
 
 
+async def job_noon_signal(bot: Bot):
+    """
+    Fires at exactly 12:00 PM IST.
+    Posts a mechanical trade signal — no checklist gates.
+    Based on backtesting: shorting ATM straddle at 12 PM with 30% TP
+    has 100% trigger rate across all tested days.
+    Skipped if a position is already active or skip_today is set.
+    """
+    if state.skip_today:
+        logger.info("Noon signal skipped — skip_today is set")
+        return
+    if state.position_active:
+        logger.info("Noon signal skipped — position already active")
+        return
+
+    logger.info("Running noon signal")
+    snapshot = await fetch_full_snapshot()
+    if snapshot is None:
+        await send_message(bot, format_error("noon signal", "Failed to fetch data"))
+        return
+
+    candidate = find_best_strike(snapshot.straddles, snapshot.btc_spot, snapshot.hours_to_expiry)
+    msg = format_noon_signal(snapshot, candidate)
+    await send_message(bot, msg)
+
+
 # ── Telegram Commands ─────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,8 +394,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if snapshot is None:
         await update.message.reply_text("❌ Failed to fetch market data. Try again.")
         return
+    checklist_result = run_pretrade_checklist(snapshot)
     await update.message.reply_text(
-        format_hourly_snapshot(snapshot),
+        format_hourly_snapshot(snapshot, checklist_result),
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
@@ -400,7 +430,7 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state.tp_pct_override is not None:
             tp_pct = state.tp_pct_override / 100
         else:
-            tp_pct = 0.40 if is_weekend else 0.50
+            tp_pct = 0.30  # default: 30% decay, backtesting-validated
 
         state.position_active = True
         state.entry_price = price
@@ -545,6 +575,16 @@ async def post_init(application: Application) -> None:
         id="entry_window_scan",
         name="Entry window scan",
         misfire_grace_time=60,
+    )
+
+    # Noon signal — 12:00 PM IST, mechanical entry, no checklist
+    scheduler.add_job(
+        job_noon_signal,
+        CronTrigger(hour=12, minute=0, timezone=IST),
+        args=[bot],
+        id="noon_signal",
+        name="Noon trade signal",
+        misfire_grace_time=120,
     )
 
     # Position monitor — every N minutes all day

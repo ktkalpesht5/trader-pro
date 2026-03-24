@@ -28,15 +28,13 @@ def _ef(val: float, fmt: str = ".1f") -> str:
     return _escape(format(val, fmt))
 
 
-def format_hourly_snapshot(snapshot: MarketSnapshot) -> str:
+def format_hourly_snapshot(snapshot: MarketSnapshot, checklist_result=None) -> str:
+    """
+    checklist_result: optional ChecklistResult — adds A/B score line at bottom.
+    Pass it from job_hourly_scan so the message is searchable by verdict.
+    """
     now = _now_ist_str()
     hours = snapshot.hours_to_expiry
-
-    atm = None
-    if snapshot.straddles:
-        btc = snapshot.btc_spot
-        nearest = min(snapshot.straddles, key=lambda s: abs(s["strike"] - btc))
-        atm = nearest
 
     iv_rv_sign = "+" if snapshot.iv_rv_spread >= 0 else ""
     iv_rv_label = "seller edge" if snapshot.iv_rv_spread > 0 else "buyer edge"
@@ -45,43 +43,63 @@ def format_hourly_snapshot(snapshot: MarketSnapshot) -> str:
     lines = [
         f"📡 *Hourly Scan* — {_escape(now)}",
         "",
-        f"🪙 BTC: *${snapshot.btc_spot:,.0f}*",
+        f"🪙 BTC: *${snapshot.btc_spot:,.0f}*  "
+        f"\\|  4h move: *${snapshot.btc_4h_move:,.0f}*",
         f"⏳ To expiry: *{_ef(hours)}hrs*",
         f"📊 24h range: ${snapshot.btc_24h_range:,.0f}  "
         f"\\(H: ${snapshot.btc_24h_high:,.0f}  L: ${snapshot.btc_24h_low:,.0f}\\)",
         "",
-        f"📈 IV: *{_ef(snapshot.implied_vol, '.0f')}%*  RV: *{_ef(snapshot.realised_vol, '.0f')}%*",
-        f"📉 IV\\-RV: *{_escape(iv_rv_sign + format(snapshot.iv_rv_spread, '.1f'))}pp*  "
-        f"\\({iv_rv_label}\\)",
+        f"📈 IV: *{_ef(snapshot.implied_vol, '.1f')}%*  \\|  RV \\(30d\\): *{_ef(snapshot.realised_vol, '.1f')}%*",
+        f"📉 IV\\-RV spread: *{_escape(iv_rv_sign + format(snapshot.iv_rv_spread, '.1f'))}pp*  — {_escape(iv_rv_label)}",
         "",
         f"🎯 Max Pain: *${snapshot.max_pain:,.0f}*  "
         f"\\(gap: ${abs(snapshot.max_pain - snapshot.btc_spot):,.0f}\\)",
         f"📊 PCR: *{_ef(snapshot.pcr, '.2f')}*  \\({pcr_label}\\)",
     ]
 
-    if atm:
-        g = atm.get("greeks", {})
-        theta_hr = abs(g.get("theta", 0)) / 24
-        theta_ratio = (theta_hr / atm["mark_price"] * 100) if atm["mark_price"] > 0 else 0
-        delta_val = g.get("delta", 0)
-        gamma_val = g.get("gamma", 0)
-        vega_val = g.get("vega", 0)
-        iv_val = atm.get("iv", 0)
-        iv_pct = iv_val * 100 if iv_val < 5 else iv_val  # normalise if decimal
-        vol = atm.get("volume_24h", 0)
-        oi = atm.get("oi", 0)
+    # ── Straddle chain: top 3 by |delta| (most neutral first) ────────────────
+    best_symbol = checklist_result.best_candidate.symbol if (
+        checklist_result and checklist_result.best_candidate
+    ) else None
+
+    if snapshot.straddles:
+        # Sort by |delta| ascending so most neutral comes first
+        chain = sorted(
+            [s for s in snapshot.straddles if s["mark_price"] > 0],
+            key=lambda s: abs(s["greeks"].get("delta", 99)),
+        )[:3]
+
+        lines += ["", "🔗 *Straddle Chain* \\(top 3 by \\|Δ\\|\\):"]
+        for s in chain:
+            g = s["greeks"]
+            delta_val = g.get("delta", 0)
+            theta_hr = abs(g.get("theta", 0)) / 24
+            theta_ratio = (theta_hr / s["mark_price"] * 100) if s["mark_price"] > 0 else 0
+            gamma_val = g.get("gamma", 0)
+            vega_val = g.get("vega", 0)
+            iv_val = s.get("iv", 0)
+            iv_pct = iv_val * 100 if iv_val < 5 else iv_val
+            vol = s.get("volume_24h", 0)
+            marker = "  ← *bot pick*" if s["symbol"] == best_symbol else ""
+
+            lines += [
+                f"",
+                f"  `{_escape(s['symbol'])}`{marker}",
+                f"  Strike ${s['strike']:,.0f}  \\|  Price *${s['mark_price']:,.0f}*  \\|  IV {_ef(iv_pct, '.1f')}%",
+                f"  Δ\\={_ef(delta_val, '.3f')}  γ\\={_ef(gamma_val, '.6f')}  "
+                f"θ\\=${_ef(theta_hr, '.2f')}/hr\\({_ef(theta_ratio, '.2f')}%\\)  ν\\={_ef(vega_val, '.2f')}",
+                f"  Vol ${vol:,.0f}",
+            ]
+
+    # ── Checklist score summary ───────────────────────────────────────────────
+    if checklist_result:
+        r = checklist_result
+        verdict_emoji = {"TRADE": "✅", "WAIT": "⏳", "PASS": "🚫"}.get(r.verdict, "❓")
         lines += [
             "",
-            f"🔑 *ATM Straddle*: `{_escape(atm['symbol'])}`",
-            f"   Strike: ${atm['strike']:,.0f}  \\|  Price: *${atm['mark_price']:,.0f}*",
-            f"   IV: *{_ef(iv_pct, '.1f')}%*  \\|  4h move: *${snapshot.btc_4h_move:,.0f}*",
-            "",
-            f"   *Greeks:*",
-            f"   Δ\\={_ef(delta_val, '.3f')}  γ\\={_ef(gamma_val, '.6f')}",
-            f"   θ\\=${_ef(theta_hr, '.2f')}/hr  \\({_ef(theta_ratio, '.2f')}%/hr\\)",
-            f"   ν\\={_ef(vega_val, '.2f')}",
-            "",
-            f"   Vol 24h: ${vol:,.0f}  \\|  OI: {_ef(oi, '.0f')} contracts",
+            f"📋 Checklist: A {r.section_a_pass}/{r.section_a_total}  \\|  "
+            f"B {r.section_b_pass}/{r.section_b_total}  →  "
+            f"*{r.verdict}* {verdict_emoji}",
         ]
 
     if 0 < hours < 6:
@@ -206,6 +224,84 @@ def format_monitor_alert(alert: MonitorAlert, entry_symbol: str, strike: float) 
         "",
         "━━━ *ACTION* ━━━",
         f"*{_escape(alert.action)}* — {_escape(alert.reason)}",
+    ]
+
+    return "\n".join(lines)
+
+
+def format_noon_signal(snapshot: MarketSnapshot, candidate) -> str:
+    """
+    Clean trade signal posted at 12:00 PM IST.
+    No checklist — purely mechanical entry based on backtesting.
+    candidate is a StraddleCandidate (may be None if chain is empty).
+    """
+    now = _now_ist_str()
+    tp_pct = 30
+    sl_pct = 70
+    iv_rv_sign = "+" if snapshot.iv_rv_spread >= 0 else ""
+
+    lines = [
+        f"🚨 *SHORT NOW* — {_escape(now)}",
+        f"_Mechanical entry \\| 30% TP \\| hard exit 4:30 PM IST_",
+        "",
+        f"🪙 BTC: *${snapshot.btc_spot:,.0f}*  \\|  ⏳ *{_ef(snapshot.hours_to_expiry, '.1f')}hrs* to expiry",
+        f"📊 4h move: ${snapshot.btc_4h_move:,.0f}  \\|  24h range: ${snapshot.btc_24h_range:,.0f}",
+    ]
+
+    if candidate:
+        tp_price = round(candidate.price * (1 - tp_pct / 100))
+        sl_price = round(candidate.price * (1 + sl_pct / 100))
+        lines += [
+            "",
+            f"━━━ *TRADE* ━━━",
+            f"📋 *{_escape(candidate.symbol)}*",
+            f"Strike: *${candidate.strike:,.0f}*  \\|  Entry: *~${candidate.price:,.0f}*",
+            f"🎯 TP: *${tp_price:,.0f}*  \\({tp_pct}% decay\\)",
+            f"🛑 SL: *${sl_price:,.0f}*  \\({sl_pct}% rise\\)",
+            f"⏰ Hard exit: *4:30 PM IST*",
+            "",
+            f"Δ\\={_ef(candidate.delta, '.3f')}  "
+            f"γ\\={_ef(candidate.gamma, '.6f')}",
+            f"θ\\=${_ef(candidate.theta_per_hour, '.2f')}/hr  \\({_ef(candidate.theta_ratio * 100, '.2f')}%/hr\\)",
+            f"ν\\={_ef(candidate.vega, '.2f')}  \\|  Vol ${candidate.volume_24h:,.0f}",
+        ]
+
+        # Full chain for context — all straddles sorted by |delta|
+        if snapshot.straddles:
+            chain = sorted(
+                [s for s in snapshot.straddles if s["mark_price"] > 0],
+                key=lambda s: abs(s["greeks"].get("delta", 99)),
+            )
+            lines += ["", "━━━ *Full Chain* ━━━"]
+            for s in chain:
+                g = s["greeks"]
+                d = g.get("delta", 0)
+                th = abs(g.get("theta", 0)) / 24
+                tr = (th / s["mark_price"] * 100) if s["mark_price"] > 0 else 0
+                marker = " ←" if s["symbol"] == candidate.symbol else "  "
+                lines.append(
+                    f"`{_escape(s['symbol'])}`{marker}  "
+                    f"${s['mark_price']:,.0f}  Δ\\={_ef(d, '.3f')}  "
+                    f"θ\\={_ef(tr, '.2f')}%/hr"
+                )
+
+        lines += [
+            "",
+            f"━━━ *Confirm entry* ━━━",
+            f"`/entry {candidate.price:.0f} {_escape(candidate.symbol)}`",
+        ]
+    else:
+        lines += [
+            "",
+            "⚠️ *No valid straddle found in chain*",
+            "Check Delta Exchange manually — chain may not be live yet\\.",
+        ]
+
+    lines += [
+        "",
+        f"📈 IV: *{_ef(snapshot.implied_vol, '.1f')}%*  \\|  RV: *{_ef(snapshot.realised_vol, '.1f')}%*  "
+        f"\\|  Spread: *{_escape(iv_rv_sign + format(snapshot.iv_rv_spread, '.1f'))}pp*",
+        f"🎯 Max Pain: ${snapshot.max_pain:,.0f}  \\|  PCR: {_ef(snapshot.pcr, '.2f')}",
     ]
 
     return "\n".join(lines)
