@@ -110,7 +110,7 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
             btc_task = asyncio.create_task(client.get_btc_spot())
             straddles_task = asyncio.create_task(client.get_today_straddles())
             options_task = asyncio.create_task(client.get_options_chain())
-            candles_task = asyncio.create_task(client.get_btc_candles(resolution="1h", count=48))
+            candles_task = asyncio.create_task(client.get_btc_candles(resolution="1h", count=720))
             candles_5m_task = asyncio.create_task(client.get_btc_candles(resolution="5m", count=100))
 
             btc_spot, straddles, options_chain, candles_1h, candles_5m = await asyncio.gather(
@@ -146,7 +146,7 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
         pcr, max_pain, calls_oi, puts_oi = calculate_pcr_and_max_pain(options_chain)
 
         # Realised Volatility (from 24 hours of 1hr candles)
-        rv = calculate_realised_vol(candles_1h, window=24) if candles_1h else 0.0
+        rv = calculate_realised_vol(candles_1h, window=720) if candles_1h else 0.0
 
         # Implied Vol — from the nearest ATM straddle
         atm_iv = 0.0
