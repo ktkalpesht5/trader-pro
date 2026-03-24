@@ -87,7 +87,7 @@ def format_hourly_snapshot(snapshot: MarketSnapshot, checklist_result=None) -> s
                 f"  `{_escape(s['symbol'])}`{marker}",
                 f"  Strike ${s['strike']:,.0f}  \\|  Price *${s['mark_price']:,.0f}*  \\|  IV {_ef(iv_pct, '.1f')}%",
                 f"  Δ\\={_ef(delta_val, '.3f')}  γ\\={_ef(gamma_val, '.6f')}  "
-                f"θ\\=${_ef(theta_hr, '.2f')}/hr\\({_ef(theta_ratio, '.2f')}%\\)  ν\\={_ef(vega_val, '.2f')}",
+                f"θ\\=${_ef(theta_hr, '.2f')}/hr  ν\\={_ef(vega_val, '.2f')}",
                 f"  Vol ${vol:,.0f}",
             ]
 
@@ -262,7 +262,7 @@ def format_noon_signal(snapshot: MarketSnapshot, candidate) -> str:
             "",
             f"Δ\\={_ef(candidate.delta, '.3f')}  "
             f"γ\\={_ef(candidate.gamma, '.6f')}",
-            f"θ\\=${_ef(candidate.theta_per_hour, '.2f')}/hr  \\({_ef(candidate.theta_ratio * 100, '.2f')}%/hr\\)",
+            f"θ\\=${_ef(candidate.theta_per_hour, '.2f')}/hr",
             f"ν\\={_ef(candidate.vega, '.2f')}  \\|  Vol ${candidate.volume_24h:,.0f}",
         ]
 
@@ -282,7 +282,7 @@ def format_noon_signal(snapshot: MarketSnapshot, candidate) -> str:
                 lines.append(
                     f"`{_escape(s['symbol'])}`{marker}  "
                     f"${s['mark_price']:,.0f}  Δ\\={_ef(d, '.3f')}  "
-                    f"θ\\={_ef(tr, '.2f')}%/hr"
+                    f"θ\\=${_ef(th, '.2f')}/hr"
                 )
 
         lines += [
