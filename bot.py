@@ -441,17 +441,16 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state.entry_time = now_ist
 
         msg = (
-            f"✅ *Position Logged*\n\n"
-            f"Symbol: `{symbol}`\n"
+            f"✅ Position Logged\n\n"
+            f"Symbol: {symbol}\n"
             f"Entry: ${price:,.0f}\n"
             f"Strike: ${strike:,.0f}\n"
             f"TP: ${state.tp_target:,.0f}\n"
             f"SL: ${state.sl_target:,.0f}\n"
             f"Hard exit: 4:30 PM IST\n\n"
-            f"Monitoring every {MONITOR_INTERVAL_MINUTES} minutes\\."
+            f"Monitoring every {MONITOR_INTERVAL_MINUTES} minutes."
         )
-        msg = msg.replace("-", "\\-").replace(".", "\\.")
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+        await update.message.reply_text(msg)
 
     except (ValueError, IndexError) as e:
         await update.message.reply_text(f"❌ Error parsing entry: {e}")
