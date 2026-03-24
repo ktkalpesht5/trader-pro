@@ -62,12 +62,26 @@ def format_hourly_snapshot(snapshot: MarketSnapshot) -> str:
     if atm:
         g = atm.get("greeks", {})
         theta_hr = abs(g.get("theta", 0)) / 24
+        theta_ratio = (theta_hr / atm["mark_price"] * 100) if atm["mark_price"] > 0 else 0
         delta_val = g.get("delta", 0)
+        gamma_val = g.get("gamma", 0)
+        vega_val = g.get("vega", 0)
+        iv_val = atm.get("iv", 0)
+        iv_pct = iv_val * 100 if iv_val < 5 else iv_val  # normalise if decimal
+        vol = atm.get("volume_24h", 0)
+        oi = atm.get("oi", 0)
         lines += [
             "",
-            f"🔑 ATM: *{_escape(atm['symbol'])}*",
-            f"   Price: ${atm['mark_price']:,.0f}  \\|  Δ\\={_ef(delta_val, '.2f')}  "
-            f"\\|  θ\\=${_ef(theta_hr, '.1f')}/hr",
+            f"🔑 *ATM Straddle*: `{_escape(atm['symbol'])}`",
+            f"   Strike: ${atm['strike']:,.0f}  \\|  Price: *${atm['mark_price']:,.0f}*",
+            f"   IV: *{_ef(iv_pct, '.1f')}%*  \\|  4h move: *${snapshot.btc_4h_move:,.0f}*",
+            "",
+            f"   *Greeks:*",
+            f"   Δ\\={_ef(delta_val, '.3f')}  γ\\={_ef(gamma_val, '.6f')}",
+            f"   θ\\=${_ef(theta_hr, '.2f')}/hr  \\({_ef(theta_ratio, '.2f')}%/hr\\)",
+            f"   ν\\={_ef(vega_val, '.2f')}",
+            "",
+            f"   Vol 24h: ${vol:,.0f}  \\|  OI: {_ef(oi, '.0f')} contracts",
         ]
 
     if 0 < hours < 6:
@@ -222,6 +236,7 @@ def format_startup_message() -> str:
         f"`/status` — current market snapshot\n"
         f"`/entry PRICE SYMBOL` — log entry \\(e\\.g\\. `/entry 601 MV\\-BTC\\-70600\\-200326`\\)\n"
         f"`/exit` — clear active position\n"
+        f"`/tp PCT` — set TP decay target \\(e\\.g\\. `/tp 30`\\), `/tp reset` for default\n"
         f"`/skip REASON` — skip today's trading\n"
         f"`/resume` — re\\-enable after skip\n"
         f"`/help` — show this message"
