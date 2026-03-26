@@ -113,13 +113,14 @@ def format_hourly_snapshot(snapshot: MarketSnapshot, checklist_result=None) -> s
 def format_pretrade_report(result: ChecklistResult, snapshot: MarketSnapshot) -> str:
     now = _now_ist_str()
     verdict_emoji = {"TRADE": "✅", "WAIT": "⏳", "PASS": "🚫"}.get(result.verdict, "❓")
-    confidence_emoji = {"HIGH": "🔥", "MEDIUM": "👍", "LOW": "⚠️"}.get(result.confidence, "")
+    # Only show confidence emoji for TRADE — PASS/WAIT don't get 🔥
+    confidence_emoji = {"HIGH": "🔥", "MEDIUM": "👍", "LOW": "⚠️"}.get(result.confidence, "") if result.verdict == "TRADE" else ""
     iv_rv_sign = "+" if snapshot.iv_rv_spread >= 0 else ""
 
     lines = [
         f"🎯 *Entry Window Scan* — {_escape(now)}",
         "",
-        f"{verdict_emoji} *{result.verdict}* {confidence_emoji} \\[{result.confidence}\\]",
+        f"{verdict_emoji} *{result.verdict}*{' ' + confidence_emoji if confidence_emoji else ''} \\[{result.confidence}\\]",
         "",
         f"🪙 BTC: *${snapshot.btc_spot:,.0f}*  \\|  ⏳ {_ef(result.hours_to_expiry)}hrs to expiry",
         f"📊 Regime: *{_escape(result.regime)}*",
@@ -229,10 +230,11 @@ def format_monitor_alert(alert: MonitorAlert, entry_symbol: str, strike: float) 
     return "\n".join(lines)
 
 
-def format_noon_signal(snapshot: MarketSnapshot, candidate) -> str:
+def format_noon_signal(snapshot: MarketSnapshot, candidate, checklist_result=None) -> str:
     """
-    Clean trade signal posted at 12:00 PM IST.
-    No checklist — purely mechanical entry based on backtesting.
+    Trade signal posted at 12:00 PM IST.
+    checklist_result: optional ChecklistResult — if verdict is PASS, the header
+    changes to ⚠️ CAUTION and the Section A failures are listed prominently.
     candidate is a StraddleCandidate (may be None if chain is empty).
     """
     now = _now_ist_str()
@@ -240,10 +242,32 @@ def format_noon_signal(snapshot: MarketSnapshot, candidate) -> str:
     sl_pct = 70
     iv_rv_sign = "+" if snapshot.iv_rv_spread >= 0 else ""
 
-    lines = [
-        f"🚨 *SHORT NOW* — {_escape(now)}",
-        f"_Mechanical entry \\| 30% TP \\| hard exit 4:30 PM IST_",
-        "",
+    # Determine header based on checklist verdict
+    is_caution = checklist_result is not None and checklist_result.verdict == "PASS"
+
+    if is_caution:
+        # Collect the specific Section A failures to surface them
+        a_failures = [
+            detail for name, passed, detail in checklist_result.section_a_details
+            if not passed and "A4" not in name
+        ]
+        lines = [
+            f"⚠️ *CAUTION — Review before shorting* — {_escape(now)}",
+            f"_Mechanical entry \\| 30% TP \\| hard exit 4:30 PM IST_",
+            "",
+            f"🚩 *Checklist PASS* — hard gate failures:",
+        ]
+        for f in a_failures:
+            lines.append(f"  • {_escape(f)}")
+        lines += [""]
+    else:
+        lines = [
+            f"🚨 *SHORT NOW* — {_escape(now)}",
+            f"_Mechanical entry \\| 30% TP \\| hard exit 4:30 PM IST_",
+            "",
+        ]
+
+    lines += [
         f"🪙 BTC: *${snapshot.btc_spot:,.0f}*  \\|  ⏳ *{_ef(snapshot.hours_to_expiry, '.1f')}hrs* to expiry",
         f"📊 4h move: ${snapshot.btc_4h_move:,.0f}  \\|  24h range: ${snapshot.btc_24h_range:,.0f}",
     ]

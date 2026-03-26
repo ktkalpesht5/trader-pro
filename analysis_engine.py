@@ -307,7 +307,11 @@ def find_best_strike(
         gamma = greeks.get("gamma", 99)
         theta = abs(greeks.get("theta", 0))
         vega = greeks.get("vega", 99)
-        iv = s.get("iv", 0) * 100 if s.get("iv", 0) < 5 else s.get("iv", 0)
+        raw_iv = s.get("iv", 0) or 0
+        iv = raw_iv * 100 if raw_iv < 5 else raw_iv
+        # Fallback: back-calculate IV from straddle price when API returns 0
+        if iv == 0 and price > 0 and hours_to_expiry > 0:
+            iv = calculate_implied_vol_from_straddle(price, btc_spot, strike, hours_to_expiry)
 
         # Must-pass filters
         if delta > DELTA_MAX:

@@ -171,9 +171,11 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
         btc_24h_low = min((c["low"] for c in candles_1h[-24:]), default=btc_spot)
         btc_24h_range = btc_24h_high - btc_24h_low
 
-        # BTC 4hr move (from last 4 hourly candles)
-        if len(candles_1h) >= 4:
-            price_4h_ago = candles_1h[-4]["open"]
+        # BTC 4hr move — candles are sorted ascending (oldest first, newest last).
+        # [-1] = most recent candle, [-5] = the candle that closed ~4 hours ago.
+        # Use close price for a more accurate reference point.
+        if len(candles_1h) >= 5:
+            price_4h_ago = candles_1h[-5]["close"]
             btc_4h_move = abs(btc_spot - price_4h_ago)
         else:
             btc_4h_move = 0.0
@@ -373,8 +375,12 @@ async def job_noon_signal(bot: Bot):
         await send_message(bot, format_error("noon signal", "Failed to fetch data"))
         return
 
+    result = run_pretrade_checklist(snapshot)
+    if result.verdict == "PASS":
+        logger.info(f"Noon signal sending with caution — checklist PASS: {result.summary}")
+
     candidate = find_best_strike(snapshot.straddles, snapshot.btc_spot, snapshot.hours_to_expiry)
-    msg = format_noon_signal(snapshot, candidate)
+    msg = format_noon_signal(snapshot, candidate, checklist_result=result)
     await send_message(bot, msg)
 
 
@@ -552,10 +558,12 @@ async def post_init(application: Application) -> None:
     bot = application.bot
     scheduler = AsyncIOScheduler(timezone=IST)
 
+    _tz = "Asia/Kolkata"  # use string form — more reliable across APScheduler versions
+
     # Hourly scan — every hour at :00 (except during entry window)
     scheduler.add_job(
         job_hourly_scan,
-        CronTrigger(minute=0, timezone=IST),
+        CronTrigger(minute=0, timezone=_tz),
         args=[bot],
         id="hourly_scan",
         name="Hourly market scan",
@@ -568,7 +576,7 @@ async def post_init(application: Application) -> None:
         CronTrigger(
             hour=f"{ENTRY_WINDOW_START}-{ENTRY_WINDOW_END - 1}",
             minute="0,15,30,45",
-            timezone=IST,
+            timezone=_tz,
         ),
         args=[bot],
         id="entry_window_scan",
@@ -576,10 +584,10 @@ async def post_init(application: Application) -> None:
         misfire_grace_time=60,
     )
 
-    # Noon signal — 12:00 PM IST, mechanical entry, no checklist
+    # Noon signal — 12:00 PM IST, mechanical entry (Section A gates still apply)
     scheduler.add_job(
         job_noon_signal,
-        CronTrigger(hour=12, minute=0, timezone=IST),
+        CronTrigger(hour=12, minute=0, timezone=_tz),
         args=[bot],
         id="noon_signal",
         name="Noon trade signal",

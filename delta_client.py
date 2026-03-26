@@ -103,7 +103,7 @@ class DeltaClient:
                     "symbol": symbol,
                     "strike": strike,
                     "mark_price": float(ticker.get("mark_price", 0) or 0),
-                    "volume_24h": float(ticker.get("volume", 0) or 0),
+                    "volume_24h": float(ticker.get("volume_24h", None) or ticker.get("volume", 0) or 0),
                     "oi": float(ticker.get("oi", 0) or 0),
                     "greeks": {
                         "delta": float(ticker.get("greeks", {}).get("delta", 0) or 0),
@@ -145,7 +145,10 @@ class DeltaClient:
 
         for p in products:
             symbol = p.get("symbol", "")
-            if symbol.endswith(expiry_date_str):
+            # Filter: must be BTC option expiring today (C-BTC-... or P-BTC-...)
+            if symbol.endswith(expiry_date_str) and (
+                symbol.startswith("C-BTC-") or symbol.startswith("P-BTC-")
+            ):
                 today_options.append(p)
 
         # Fetch OI for each option
@@ -159,18 +162,12 @@ class DeltaClient:
                 ticker = ticker_data.get("result", {})
                 contract_type = product.get("contract_type", "")
 
-                # Parse strike
+                # Parse strike — always at index 2: C-BTC-71000-260326 → parts[2] = "71000"
                 parts = symbol.split("-")
-                # Symbol format: C-BTC-68400-230326 or P-BTC-68400-230326
-                strike = 0
-                for part in parts:
-                    try:
-                        val = int(part)
-                        if val > 10000:  # It's the strike
-                            strike = val
-                            break
-                    except ValueError:
-                        continue
+                try:
+                    strike = int(parts[2]) if len(parts) >= 4 else 0
+                except (ValueError, IndexError):
+                    strike = 0
 
                 mark_price = float(ticker.get("mark_price", 0) or 0)
                 oi = float(ticker.get("oi", 0) or 0)
@@ -184,7 +181,7 @@ class DeltaClient:
                     "oi": oi,
                     "oi_value": oi_value,
                     "mark_price": mark_price,
-                    "volume": float(ticker.get("volume", 0) or 0),
+                    "volume": float(ticker.get("volume_24h", None) or ticker.get("volume", 0) or 0),
                 }
             except Exception:
                 return None
@@ -253,6 +250,7 @@ class DeltaClient:
                     "close": float(c[4]),
                     "volume": float(c[5]),
                 })
+        result.sort(key=lambda x: x["time"])  # ascending: oldest first, newest last
         return result
 
     # ── Time to Expiry ────────────────────────────────────────────────────────
