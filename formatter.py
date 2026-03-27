@@ -43,7 +43,7 @@ def format_hourly_snapshot(snapshot: MarketSnapshot, checklist_result=None) -> s
     iv_str = f"*{_ef(snapshot.implied_vol, '.1f')}%*" if snapshot.implied_vol else "*N/A*"
     max_pain_str = (
         f"*${snapshot.max_pain:,.0f}*  \\(gap: ${abs(snapshot.max_pain - snapshot.btc_spot):,.0f}\\)"
-        if snapshot.max_pain else "*N/A*"
+        if snapshot.max_pain else "*N/A* \\(options chain not yet listed\\)"
     )
     pcr_str = f"*{_ef(snapshot.pcr, '.2f')}*  \\({pcr_label}\\)" if snapshot.pcr else "*N/A*"
 
