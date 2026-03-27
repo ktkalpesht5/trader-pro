@@ -40,6 +40,13 @@ def format_hourly_snapshot(snapshot: MarketSnapshot, checklist_result=None) -> s
     iv_rv_label = "seller edge" if snapshot.iv_rv_spread > 0 else "buyer edge"
     pcr_label = "put heavy ✅" if snapshot.pcr > 1.2 else "call heavy ⚠️" if snapshot.pcr < 0.8 else "neutral"
 
+    iv_str = f"*{_ef(snapshot.implied_vol, '.1f')}%*" if snapshot.implied_vol else "*N/A*"
+    max_pain_str = (
+        f"*${snapshot.max_pain:,.0f}*  \\(gap: ${abs(snapshot.max_pain - snapshot.btc_spot):,.0f}\\)"
+        if snapshot.max_pain else "*N/A*"
+    )
+    pcr_str = f"*{_ef(snapshot.pcr, '.2f')}*  \\({pcr_label}\\)" if snapshot.pcr else "*N/A*"
+
     lines = [
         f"📡 *Hourly Scan* — {_escape(now)}",
         "",
@@ -49,12 +56,11 @@ def format_hourly_snapshot(snapshot: MarketSnapshot, checklist_result=None) -> s
         f"📊 24h range: ${snapshot.btc_24h_range:,.0f}  "
         f"\\(H: ${snapshot.btc_24h_high:,.0f}  L: ${snapshot.btc_24h_low:,.0f}\\)",
         "",
-        f"📈 IV: *{_ef(snapshot.implied_vol, '.1f')}%*  \\|  RV \\(30d\\): *{_ef(snapshot.realised_vol, '.1f')}%*",
+        f"📈 IV: {iv_str}  \\|  RV \\(30d\\): *{_ef(snapshot.realised_vol, '.1f')}%*",
         f"📉 IV\\-RV spread: *{_escape(iv_rv_sign + format(snapshot.iv_rv_spread, '.1f'))}pp*  — {_escape(iv_rv_label)}",
         "",
-        f"🎯 Max Pain: *${snapshot.max_pain:,.0f}*  "
-        f"\\(gap: ${abs(snapshot.max_pain - snapshot.btc_spot):,.0f}\\)",
-        f"📊 PCR: *{_ef(snapshot.pcr, '.2f')}*  \\({pcr_label}\\)",
+        f"🎯 Max Pain: {max_pain_str}",
+        f"📊 PCR: {pcr_str}",
     ]
 
     # ── Straddle chain: top 3 by |delta| (most neutral first) ────────────────
@@ -150,8 +156,8 @@ def format_pretrade_report(result: ChecklistResult, snapshot: MarketSnapshot) ->
         "",
         "━━━ *Analytics* ━━━",
         f"📊 IV\\-RV: *{_escape(iv_rv_sign + format(snapshot.iv_rv_spread, '.1f'))}pp* — {_escape(iv_rv_label)}",
-        f"🎯 Max Pain: *${snapshot.max_pain:,.0f}*  gap: ${abs(snapshot.max_pain - snapshot.btc_spot):,.0f}",
-        f"📊 PCR: *{_ef(snapshot.pcr, '.2f')}*",
+        f"🎯 Max Pain: " + (f"*${snapshot.max_pain:,.0f}*  gap: ${abs(snapshot.max_pain - snapshot.btc_spot):,.0f}" if snapshot.max_pain else "*N/A*"),
+        f"📊 PCR: " + (f"*{_ef(snapshot.pcr, '.2f')}*" if snapshot.pcr else "*N/A*"),
     ]
 
     if result.verdict == "TRADE" and result.best_candidate:
@@ -323,9 +329,11 @@ def format_noon_signal(snapshot: MarketSnapshot, candidate, checklist_result=Non
 
     lines += [
         "",
-        f"📈 IV: *{_ef(snapshot.implied_vol, '.1f')}%*  \\|  RV: *{_ef(snapshot.realised_vol, '.1f')}%*  "
+        f"📈 IV: " + (f"*{_ef(snapshot.implied_vol, '.1f')}%*" if snapshot.implied_vol else "*N/A*") +
+        f"  \\|  RV: *{_ef(snapshot.realised_vol, '.1f')}%*  "
         f"\\|  Spread: *{_escape(iv_rv_sign + format(snapshot.iv_rv_spread, '.1f'))}pp*",
-        f"🎯 Max Pain: ${snapshot.max_pain:,.0f}  \\|  PCR: {_ef(snapshot.pcr, '.2f')}",
+        f"🎯 Max Pain: " + (f"${snapshot.max_pain:,.0f}" if snapshot.max_pain else "N/A") +
+        f"  \\|  PCR: " + (_ef(snapshot.pcr, '.2f') if snapshot.pcr else "N/A"),
     ]
 
     return "\n".join(lines)

@@ -120,32 +120,40 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
     """
     try:
         async with DeltaClient() as client:
-            # Concurrent fetches for speed
-            btc_task      = asyncio.create_task(client.get_btc_spot())
-            straddles_task = asyncio.create_task(client.get_all_straddles(CONTRACT_TENORS))
-            options_task  = asyncio.create_task(client.get_options_chain())
-            candles_task  = asyncio.create_task(client.get_btc_candles(resolution="1h", count=720))
+            # Fetch straddles first so we can align options chain to same expiry date
+            straddles = await client.get_all_straddles(CONTRACT_TENORS)
+
+            # Derive the target expiry date from the soonest live straddle
+            expiry_date_str: str | None = None
+            if straddles:
+                settlement = straddles[0].get("settlement_time", "")
+                if settlement:
+                    try:
+                        from datetime import timezone
+                        st_utc = datetime.fromisoformat(settlement.replace("Z", "+00:00"))
+                        st_ist = st_utc.astimezone(IST)
+                        expiry_date_str = st_ist.strftime("%d%m%y")
+                    except Exception:
+                        pass
+
+            # Remaining fetches in parallel, options chain aligned to straddle expiry
+            btc_task        = asyncio.create_task(client.get_btc_spot())
+            options_task    = asyncio.create_task(client.get_options_chain(expiry_date_str))
+            candles_task    = asyncio.create_task(client.get_btc_candles(resolution="1h", count=720))
             candles_5m_task = asyncio.create_task(client.get_btc_candles(resolution="5m", count=100))
 
-            btc_spot, straddles, options_chain, candles_1h, candles_5m = await asyncio.gather(
-                btc_task, straddles_task, options_task, candles_task, candles_5m_task,
+            btc_spot, options_chain, candles_1h, candles_5m = await asyncio.gather(
+                btc_task, options_task, candles_task, candles_5m_task,
                 return_exceptions=True,
             )
 
         # hours_to_expiry: use the soonest-expiry straddle's value, or 0 if none
-        if straddles and not isinstance(straddles, Exception) and straddles:
-            hours_to_expiry = straddles[0]["hours_to_expiry"]  # already sorted ascending
-        else:
-            hours_to_expiry = 0.0
+        hours_to_expiry = straddles[0]["hours_to_expiry"] if straddles else 0.0
 
         # Handle fetch errors gracefully
         if isinstance(btc_spot, Exception):
             logger.error(f"Failed to fetch BTC spot: {btc_spot}")
             return None
-
-        if isinstance(straddles, Exception):
-            logger.warning(f"Failed to fetch straddles: {straddles}")
-            straddles = []
 
         if isinstance(options_chain, Exception):
             logger.warning(f"Failed to fetch options chain: {options_chain}")

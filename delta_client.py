@@ -194,13 +194,34 @@ class DeltaClient:
 
     # ── Options Chain (for PCR + Max Pain calculation) ───────────────────────
 
-    async def get_options_chain(self) -> list[dict]:
+    async def get_options_chain(self, expiry_date_str: str | None = None) -> list[dict]:
         """
-        Fetches individual call and put options for today's expiry.
+        Fetches individual call and put options for the next active expiry.
+        expiry_date_str: DDMMYY string to fetch (e.g. "280326"). If None, derives
+        from the soonest live straddle so options and straddle data are always aligned.
+        After today's 5:30 PM IST expiry, automatically uses the next day's chain.
         Used to calculate PCR and Max Pain from first principles.
         """
-        now_ist = datetime.now(IST)
-        expiry_date_str = now_ist.strftime("%d%m%y")
+        if expiry_date_str is None:
+            # Derive target date from the soonest live straddle (same logic as get_all_straddles)
+            straddles = await self.get_all_straddles()
+            if straddles:
+                # settlement_time is UTC ISO — convert to IST date string for options filter
+                settlement = straddles[0].get("settlement_time", "")
+                if settlement:
+                    try:
+                        st_utc = datetime.fromisoformat(settlement.replace("Z", "+00:00"))
+                        st_ist = st_utc.astimezone(IST)
+                        expiry_date_str = st_ist.strftime("%d%m%y")
+                    except Exception:
+                        pass
+            if expiry_date_str is None:
+                # Fallback: use tomorrow if past today's settlement cutoff
+                from datetime import timedelta
+                now_ist = datetime.now(IST)
+                cutoff  = now_ist.replace(hour=17, minute=30, second=0, microsecond=0)
+                target  = now_ist + timedelta(days=1) if now_ist > cutoff else now_ist
+                expiry_date_str = target.strftime("%d%m%y")
 
         data = await self._get("/v2/products", params={
             "contract_types": "put_options,call_options",
