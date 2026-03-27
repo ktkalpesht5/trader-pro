@@ -158,6 +158,8 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
         if isinstance(options_chain, Exception):
             logger.warning(f"Failed to fetch options chain: {options_chain}")
             options_chain = []
+        elif not options_chain:
+            logger.info(f"Options chain empty for expiry_date_str={expiry_date_str} (next-day chain not yet listed)")
 
         if isinstance(candles_1h, Exception):
             logger.warning(f"Failed to fetch 1h candles: {candles_1h}")
@@ -174,21 +176,23 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
         # Realised Volatility (from 24 hours of 1hr candles)
         rv = calculate_realised_vol(candles_1h, window=720) if candles_1h else 0.0
 
-        # Implied Vol — from the nearest ATM straddle
+        # Per-straddle IV fallback: Delta API often returns null implied_volatility
+        # for next-day contracts. Back-calculate from straddle price when missing.
+        for s in straddles:
+            direct_iv = s.get("iv", 0)
+            if direct_iv and direct_iv > 0:
+                s["iv"] = direct_iv * 100 if direct_iv < 5 else direct_iv
+            else:
+                s["iv"] = calculate_implied_vol_from_straddle(
+                    s["mark_price"], float(btc_spot), s["strike"],
+                    s.get("hours_to_expiry", hours_to_expiry),
+                )
+
+        # Implied Vol — from the nearest ATM straddle (iv already normalised above)
         atm_iv = 0.0
-        atm_price = 0.0
         if straddles:
             nearest_atm = min(straddles, key=lambda s: abs(s["strike"] - btc_spot))
-            atm_price = nearest_atm["mark_price"]
-            # Use per-straddle hours_to_expiry for accurate IV calculation
-            atm_hours = nearest_atm.get("hours_to_expiry", hours_to_expiry)
-            atm_iv = calculate_implied_vol_from_straddle(
-                atm_price, btc_spot, nearest_atm["strike"], atm_hours
-            )
-            # Also check if IV is directly available from greeks
-            direct_iv = nearest_atm.get("iv", 0)
-            if direct_iv > 0:
-                atm_iv = direct_iv * 100 if direct_iv < 5 else direct_iv
+            atm_iv = nearest_atm["iv"]  # already calculated/normalised above
 
         iv_rv_spread = atm_iv - rv
 

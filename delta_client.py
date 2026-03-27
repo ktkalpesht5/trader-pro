@@ -223,22 +223,33 @@ class DeltaClient:
                 target  = now_ist + timedelta(days=1) if now_ist > cutoff else now_ist
                 expiry_date_str = target.strftime("%d%m%y")
 
-        data = await self._get("/v2/products", params={
-            "contract_types": "put_options,call_options",
-            "underlying_asset_symbol": "BTC",
-            "page_size": 500,
-        })
+        # Fetch calls and puts in separate requests — Delta India may not support
+        # comma-separated contract_types in a single query.
+        calls_data, puts_data = await asyncio.gather(
+            self._get("/v2/products", params={
+                "contract_types": "call_options",
+                "underlying_asset_symbol": "BTC",
+                "page_size": 1000,
+            }),
+            self._get("/v2/products", params={
+                "contract_types": "put_options",
+                "underlying_asset_symbol": "BTC",
+                "page_size": 1000,
+            }),
+        )
 
-        products = data.get("result", [])
+        products = calls_data.get("result", []) + puts_data.get("result", [])
         today_options = []
 
         for p in products:
             symbol = p.get("symbol", "")
-            # Filter: must be BTC option expiring today (C-BTC-... or P-BTC-...)
+            # Filter: BTC option expiring on target date
             if symbol.endswith(expiry_date_str) and (
                 symbol.startswith("C-BTC-") or symbol.startswith("P-BTC-")
             ):
                 today_options.append(p)
+
+        logger.info(f"Options chain: found {len(today_options)} contracts for {expiry_date_str}")
 
         # Fetch OI for each option
         result = []
@@ -411,6 +422,8 @@ class DeltaClient:
         if not contracts_with_hours:
             logger.warning("No live BTC straddle contracts found")
             return []
+
+        logger.info(f"get_all_straddles: {len(contracts_with_hours)} contracts (tenors={tenors})")
 
         # Fetch tickers concurrently
         result: list[dict] = []
