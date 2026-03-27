@@ -70,6 +70,7 @@ MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "1"))
 HARD_EXIT_HOUR = int(os.getenv("HARD_EXIT_HOUR", "16"))
 HARD_EXIT_MINUTE = int(os.getenv("HARD_EXIT_MINUTE", "30"))
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "5"))
+HOLD_UPDATE_MINUTES   = int(os.getenv("HOLD_UPDATE_MINUTES", "10"))  # how often to post HOLD updates
 # Comma-separated tenor names: "daily", "weekly", "monthly" — or "all" for no filter
 _tenors_raw = os.getenv("CONTRACT_TENORS", "daily,weekly")
 CONTRACT_TENORS: list[str] | None = (
@@ -372,8 +373,18 @@ async def job_monitor_position(bot: Bot):
         is_weekend=is_weekend,
     )
 
-    msg = format_monitor_alert(alert, state.entry_symbol, state.entry_strike)
-    await send_message(bot, msg)
+    # Always post on action exits; throttle HOLD/PARTIAL to every HOLD_UPDATE_MINUTES
+    should_post = alert.action in ("EXIT", "HARD_EXIT")
+    if not should_post:
+        last_post = getattr(state, "_last_monitor_post", None)
+        elapsed   = (now_ist - last_post).total_seconds() / 60 if last_post else 999
+        if elapsed >= HOLD_UPDATE_MINUTES:
+            should_post = True
+            state._last_monitor_post = now_ist
+
+    if should_post:
+        msg = format_monitor_alert(alert, state.entry_symbol, state.entry_strike)
+        await send_message(bot, msg)
 
     # Auto-execute exit on TP/SL/HARD_EXIT
     if alert.action in ("EXIT", "HARD_EXIT") and alert.urgency in ("HIGH", "CRITICAL"):

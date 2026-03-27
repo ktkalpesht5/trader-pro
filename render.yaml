@@ -21,6 +21,8 @@ services:
         value: "5"
       - key: MONITOR_INTERVAL_MINUTES
         value: "1"
+      - key: HOLD_UPDATE_MINUTES
+        value: "10"
       - key: CONTRACT_TENORS
         value: "daily,weekly"
       - key: HARD_EXIT_HOUR
