@@ -348,9 +348,9 @@ def format_startup_message() -> str:
         f"\n"
         f"Monitoring: BTC Daily Straddles on Delta Exchange India\n"
         f"Schedule:\n"
-        f"• Hourly scan: all day\n"
-        f"• Entry window: 11 AM – 1 PM IST \\(every 15 min\\)\n"
-        f"• Post\\-entry monitor: every 10 min\n"
+        f"• Market scan: every 5 min, 24/7 \\(all tenors\\)\n"
+        f"• Entry gate: A1 = 4–5\\.5 hrs to expiry \\(per\\-straddle\\)\n"
+        f"• Post\\-entry monitor: every 1 min \\(while in trade\\)\n"
         f"\n"
         f"Commands:\n"
         f"`/status` — current market snapshot\n"
@@ -359,8 +359,65 @@ def format_startup_message() -> str:
         f"`/tp PCT` — set TP decay target \\(e\\.g\\. `/tp 30`\\), `/tp reset` for default\n"
         f"`/skip REASON` — skip today's trading\n"
         f"`/resume` — re\\-enable after skip\n"
+        f"`/dryrun on\\|off` — toggle paper trade mode\n"
         f"`/help` — show this message"
     )
+
+
+def format_auto_entry(result, candidate, snapshot: MarketSnapshot) -> str:
+    """
+    Posted when the bot autonomously enters a trade.
+    result: ExecutionResult  candidate: StraddleCandidate
+    """
+    from execution_engine import PAPER_TRADE
+    now    = _now_ist_str()
+    symbol = candidate.symbol
+    tp_pct = round((1 - result.fill_price / candidate.price) * 0, 0)  # recalc from fill
+    # Derive actual TP/SL from fill price using engine constants
+    from execution_engine import TP_PCT, SL_MULT
+    tp_price = round(result.fill_price * (1 - TP_PCT))
+    sl_price = round(result.fill_price * SL_MULT)
+
+    lines = [
+        f"🤖 *AUTO\\-ENTERED* \\| {_escape(now)}",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"`{_escape(symbol)}`",
+        f"Fill:  *${result.fill_price:,.0f}*  ×  {result.contracts} contracts",
+        f"🎯 TP:  *${tp_price:,.0f}*  \\(−{TP_PCT*100:.0f}%\\)",
+        f"🛑 SL:  *${sl_price:,.0f}*  \\(\\+{(SL_MULT-1)*100:.0f}%\\)",
+        "",
+        f"🪙 BTC: *${snapshot.btc_spot:,.0f}*  \\|  Δ\\={_ef(candidate.delta, '.3f')}",
+        f"θ/hr: *{_ef(candidate.theta_ratio * 100, '.1f')}%*  \\|  "
+        f"Vega\\={_ef(candidate.vega, '.2f')}",
+    ]
+    if PAPER_TRADE:
+        lines += ["", "_\\[PAPER TRADE\\]_"]
+    return "\n".join(lines)
+
+
+def format_auto_exit(result, alert, symbol: str) -> str:
+    """
+    Posted when the bot autonomously exits a trade.
+    result: ExecutionResult  alert: MonitorAlert
+    """
+    from execution_engine import PAPER_TRADE
+    now = _now_ist_str()
+
+    pnl_sign  = "+" if result.pnl_pct >= 0 else ""
+    pnl_emoji = "✅" if result.pnl_pct >= 0 else "🔴"
+
+    lines = [
+        f"{pnl_emoji} *CLOSED* \\| {_escape(now)}",
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"`{_escape(symbol)}`",
+        f"Exit:  *${result.fill_price:,.0f}*   Reason: {_escape(alert.reason)}",
+        f"P&L:   *{_escape(pnl_sign + f'{result.pnl_pct:.1f}%')}*"
+        f"  \\(${_escape(pnl_sign + f'{result.pnl_usd:.2f}')}\\)",
+        f"Entry: ${alert.entry_price:,.0f}  →  Exit: ${result.fill_price:,.0f}",
+    ]
+    if PAPER_TRADE:
+        lines += ["", "_\\[PAPER TRADE\\]_"]
+    return "\n".join(lines)
 
 
 def format_error(context: str, error: str) -> str:

@@ -50,9 +50,9 @@ MAX_PAIN_BAD_GAP = 2000     # > $2000 = bad
 BTC_24H_RANGE_MAX = 2500    # Section A: 24h BTC range < $2,500
 BTC_4H_MOVE_MAX = 800       # Section A: 4hr BTC move < $800
 
-TP_TARGET = 0.50            # Take profit at 50% decay
-TP_WEEKEND = 0.40           # Tighter TP on weekends
-SL_MULTIPLIER = 1.70        # Stop loss at 170% of entry
+TP_TARGET = 0.25            # Take profit at 25% decay (grid search optimal)
+TP_WEEKEND = 0.25           # Same as weekday — grid search shows 25% optimal always
+SL_MULTIPLIER = 1.20        # Stop loss at 120% of entry (grid search optimal)
 
 STRADDLE_BOUNCE_EXIT = 0.15  # If straddle rises >15% from entry → exit
 PARTIAL_PROFIT_DECAY = 0.35  # 35%+ decay after 3 PM → consider partial
@@ -111,7 +111,8 @@ class StraddleCandidate:
     volume_24h: float
     oi: float
     theta_per_hour: float = 0.0
-    theta_ratio: float = 0.0   # theta/hr as % of price
+    theta_ratio: float = 0.0       # theta/hr as % of price
+    hours_to_expiry_val: float = 0.0  # hours until this straddle's settlement
 
     def __post_init__(self):
         if self.price > 0:
@@ -307,16 +308,19 @@ def find_best_strike(
         gamma = greeks.get("gamma", 99)
         theta = abs(greeks.get("theta", 0))
         vega = greeks.get("vega", 99)
+        # Use per-straddle hours_to_expiry if available (multi-expiry support)
+        s_hours = s.get("hours_to_expiry", hours_to_expiry)
+
         raw_iv = s.get("iv", 0) or 0
         iv = raw_iv * 100 if raw_iv < 5 else raw_iv
         # Fallback: back-calculate IV from straddle price when API returns 0
-        if iv == 0 and price > 0 and hours_to_expiry > 0:
-            iv = calculate_implied_vol_from_straddle(price, btc_spot, strike, hours_to_expiry)
+        if iv == 0 and price > 0 and s_hours > 0:
+            iv = calculate_implied_vol_from_straddle(price, btc_spot, strike, s_hours)
 
         # Must-pass filters
         if delta > DELTA_MAX:
             continue
-        if gamma > GAMMA_MAX_ENTRY and hours_to_expiry > 6:
+        if gamma > GAMMA_MAX_ENTRY and s_hours > 6:
             continue
         if vega > VEGA_MAX:
             continue
@@ -340,6 +344,7 @@ def find_best_strike(
             oi=s.get("oi", 0),
             theta_per_hour=theta_per_hour,
             theta_ratio=theta_ratio,
+            hours_to_expiry_val=s_hours,
         )
         candidates.append(candidate)
 
@@ -367,10 +372,10 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
     dow = snapshot.day_of_week  # 0=Mon, 5=Sat, 6=Sun
     if dow in (5, 6):
         result.regime = "WEEKEND"
-        tp_pct = TP_WEEKEND
+        tp_pct = TP_TARGET     # grid search: 25% optimal on all days
     elif dow == 4:  # Friday
         result.regime = "CAUTION_FRIDAY"
-        tp_pct = 0.45
+        tp_pct = TP_TARGET     # grid search: 25% optimal (was 0.45, now aligned)
     else:
         result.regime = "WEEKDAY"
         tp_pct = TP_TARGET
@@ -381,13 +386,19 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
     result.gate_zero_pass = True
     result.gate_zero_reason = "No automated macro event detection — verify manually"
 
+    # ── Find best candidate early (needed for A1 per-straddle hours) ────────
+    # Pass snapshot.hours_to_expiry as fallback for straddles without settlement_time
+    atm_straddle = find_best_strike(snapshot.straddles, snapshot.btc_spot, snapshot.hours_to_expiry)
+
     # ── Section A (5 structural checks) ─────────────────────────────────────
     a_details = []
 
-    # A1: Time to expiry 4-5.5 hours
-    a1 = 4.0 <= snapshot.hours_to_expiry <= 5.5
+    # A1: Entry window — 4 to 5.5 hours to this straddle's own expiry
+    # Uses per-straddle hours_to_expiry so multi-expiry contracts are evaluated correctly
+    cand_hours = atm_straddle.hours_to_expiry_val if atm_straddle else snapshot.hours_to_expiry
+    a1 = 4.0 <= cand_hours <= 5.5
     a_details.append(("A1: Entry window (4-5.5hrs)", a1,
-                       f"{snapshot.hours_to_expiry:.1f}hrs to expiry"))
+                       f"{cand_hours:.1f}hrs to expiry"))
 
     # A2: BTC 4hr move < $800
     a2 = snapshot.btc_4h_move < BTC_4H_MOVE_MAX
@@ -403,9 +414,8 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
     a4 = True
     a_details.append(("A4: No macro events", a4, "Manual check — verify"))
 
-    # A5: Straddle chain check (at least one valid ATM with |delta| < 0.15)
-    atm_straddle = find_best_strike(snapshot.straddles, snapshot.btc_spot, snapshot.hours_to_expiry)
-    a5 = atm_straddle is not None
+    # A5: Valid candidate exists with |delta| < 0.15 in the entry window
+    a5 = atm_straddle is not None and a1
     a_details.append(("A5: Valid ATM strike available", a5,
                        f"Best: {atm_straddle.symbol} Δ={atm_straddle.delta:.2f}" if atm_straddle else "No strike with |delta| < 0.15"))
 
@@ -478,7 +488,7 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
     if section_a_hard_fail:
         failures = []
         if not a1:
-            failures.append(f"time window ({snapshot.hours_to_expiry:.1f}hrs)")
+            failures.append(f"time window ({cand_hours:.1f}hrs)")
         if not a2:
             failures.append(f"4hr BTC move (${snapshot.btc_4h_move:.0f})")
         if not a3:

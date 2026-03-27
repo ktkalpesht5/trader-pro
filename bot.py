@@ -18,7 +18,6 @@ from typing import Optional
 import pytz
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram import Update, Bot
 from telegram.ext import (
@@ -29,6 +28,8 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from delta_client import DeltaClient
+from state_store import load_position, save_position, clear_position
+from execution_engine import enter_trade, exit_trade, ExecutionResult, PAPER_TRADE
 from analysis_engine import (
     MarketSnapshot,
     run_pretrade_checklist,
@@ -42,10 +43,11 @@ from formatter import (
     format_hourly_snapshot,
     format_pretrade_report,
     format_monitor_alert,
-    format_noon_signal,
     format_skip_notification,
     format_startup_message,
     format_error,
+    format_auto_entry,
+    format_auto_exit,
 )
 
 load_dotenv()
@@ -62,11 +64,18 @@ IST = pytz.timezone("Asia/Kolkata")
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
-ENTRY_WINDOW_START = int(os.getenv("ENTRY_WINDOW_START", "11"))
+ENTRY_WINDOW_START = int(os.getenv("ENTRY_WINDOW_START", "11"))   # kept for manual /check display
 ENTRY_WINDOW_END = int(os.getenv("ENTRY_WINDOW_END", "13"))
-MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "10"))
+MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "1"))
 HARD_EXIT_HOUR = int(os.getenv("HARD_EXIT_HOUR", "16"))
 HARD_EXIT_MINUTE = int(os.getenv("HARD_EXIT_MINUTE", "30"))
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "5"))
+# Comma-separated tenor names: "daily", "weekly", "monthly" — or "all" for no filter
+_tenors_raw = os.getenv("CONTRACT_TENORS", "daily,weekly")
+CONTRACT_TENORS: list[str] | None = (
+    None if _tenors_raw.strip().lower() == "all"
+    else [t.strip() for t in _tenors_raw.split(",") if t.strip()]
+)
 
 
 # ── Bot State ─────────────────────────────────────────────────────────────────
@@ -80,7 +89,7 @@ class BotState:
         self.skip_today: bool = False
         self.skip_reason: str = ""
 
-        # Active position (set by /entry command)
+        # Active position (set by /entry command or auto-execution)
         self.position_active: bool = False
         self.entry_price: float = 0.0
         self.entry_symbol: str = ""
@@ -88,6 +97,8 @@ class BotState:
         self.tp_target: float = 0.0
         self.sl_target: float = 0.0
         self.entry_time: Optional[datetime] = None
+        self.entry_contracts: int = 0
+        self.entry_product_id: int = 0
 
         # TP override — set by /tp command (e.g. /tp 30 sets 30% decay target)
         self.tp_pct_override: Optional[float] = None
@@ -109,10 +120,10 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
     try:
         async with DeltaClient() as client:
             # Concurrent fetches for speed
-            btc_task = asyncio.create_task(client.get_btc_spot())
-            straddles_task = asyncio.create_task(client.get_today_straddles())
-            options_task = asyncio.create_task(client.get_options_chain())
-            candles_task = asyncio.create_task(client.get_btc_candles(resolution="1h", count=720))
+            btc_task      = asyncio.create_task(client.get_btc_spot())
+            straddles_task = asyncio.create_task(client.get_all_straddles(CONTRACT_TENORS))
+            options_task  = asyncio.create_task(client.get_options_chain())
+            candles_task  = asyncio.create_task(client.get_btc_candles(resolution="1h", count=720))
             candles_5m_task = asyncio.create_task(client.get_btc_candles(resolution="5m", count=100))
 
             btc_spot, straddles, options_chain, candles_1h, candles_5m = await asyncio.gather(
@@ -120,7 +131,11 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
                 return_exceptions=True,
             )
 
-            hours_to_expiry = client.hours_to_expiry()
+        # hours_to_expiry: use the soonest-expiry straddle's value, or 0 if none
+        if straddles and not isinstance(straddles, Exception) and straddles:
+            hours_to_expiry = straddles[0]["hours_to_expiry"]  # already sorted ascending
+        else:
+            hours_to_expiry = 0.0
 
         # Handle fetch errors gracefully
         if isinstance(btc_spot, Exception):
@@ -156,8 +171,10 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
         if straddles:
             nearest_atm = min(straddles, key=lambda s: abs(s["strike"] - btc_spot))
             atm_price = nearest_atm["mark_price"]
+            # Use per-straddle hours_to_expiry for accurate IV calculation
+            atm_hours = nearest_atm.get("hours_to_expiry", hours_to_expiry)
             atm_iv = calculate_implied_vol_from_straddle(
-                atm_price, btc_spot, nearest_atm["strike"], hours_to_expiry
+                atm_price, btc_spot, nearest_atm["strike"], atm_hours
             )
             # Also check if IV is directly available from greeks
             direct_iv = nearest_atm.get("iv", 0)
@@ -231,66 +248,76 @@ async def send_message(bot: Bot, text: str):
 
 # ── Scheduled Jobs ────────────────────────────────────────────────────────────
 
-async def job_hourly_scan(bot: Bot):
+async def job_scan(bot: Bot):
     """
-    Runs every hour outside the entry window.
-    Posts a brief market context update.
+    Unified market scan — runs every SCAN_INTERVAL_MINUTES (default 5) minutes, 24/7.
+
+    Behaviour:
+    - Always fetches straddles across all configured tenors (CONTRACT_TENORS).
+    - While no position is active: runs full pre-trade checklist.
+      If TRADE verdict → auto-executes entry (A1 gate uses per-straddle hours_to_expiry,
+      so only straddles genuinely 4-5.5 hours from expiry qualify regardless of clock time).
+    - Suppresses Telegram output when checklist verdict is PASS and no alert-worthy change.
+      Avoids spamming the channel with 288 identical "no trade" messages per day.
     """
-    now_ist = datetime.now(IST)
-    if ENTRY_WINDOW_START <= now_ist.hour < ENTRY_WINDOW_END:
-        return  # Entry window jobs handle this period
-
-    logger.info(f"Hourly scan at {now_ist.strftime('%H:%M IST')}")
-
-    if state.skip_today:
-        return  # Silent on skip days
-
-    snapshot = await fetch_full_snapshot()
-    if snapshot is None:
-        await send_message(bot, format_error("hourly scan", "Failed to fetch market data"))
-        return
-
-    checklist_result = run_pretrade_checklist(snapshot)
-    msg = format_hourly_snapshot(snapshot, checklist_result)
-    await send_message(bot, msg)
-
-
-async def job_entry_window_scan(bot: Bot):
-    """
-    Runs every 15 minutes during 11 AM – 1 PM IST.
-    Runs full pre-trade checklist and posts TRADE/WAIT/PASS verdict.
-    """
-    now_ist = datetime.now(IST)
-    if not (ENTRY_WINDOW_START <= now_ist.hour < ENTRY_WINDOW_END):
-        return
-
     if state.skip_today:
         return
 
-    if state.position_active:
-        return  # Don't scan for new entries while in a position
-
-    logger.info(f"Entry window scan at {now_ist.strftime('%H:%M IST')}")
+    now_ist = datetime.now(IST)
+    logger.debug(f"Scan at {now_ist.strftime('%H:%M IST')}")
 
     snapshot = await fetch_full_snapshot()
     if snapshot is None:
-        await send_message(bot, format_error("entry window scan", "Failed to fetch data"))
+        # Only post errors, don't spam
+        logger.warning("Scan: failed to fetch snapshot")
         return
 
-    result = run_pretrade_checklist(snapshot)
-    msg = format_pretrade_report(result, snapshot)
-    await send_message(bot, msg)
+    state.last_snapshot = snapshot
 
-    # Auto-notify if it's a TRADE verdict
-    if result.verdict == "TRADE" and result.best_candidate:
-        extra = (
-            f"🔔 *TRADE SIGNAL FIRED*\n"
-            f"Enter `{result.best_candidate.symbol}` at market/limit ~${result.best_candidate.price:,.0f}\n"
-            f"Then confirm with: `/entry {result.best_candidate.price:.0f} {result.best_candidate.symbol}`"
-        )
-        # Escape for markdown
-        extra = extra.replace("-", "\\-").replace(".", "\\.").replace("(", "\\(").replace(")", "\\)")
-        await send_message(bot, extra)
+    if not state.position_active:
+        result = run_pretrade_checklist(snapshot)
+
+        # Post to Telegram only when something worth seeing:
+        # TRADE signal, WAIT (conditions close but not yet), or the first PASS after a non-PASS
+        prev_verdict = getattr(state, "_last_verdict", None)
+        if result.verdict in ("TRADE", "WAIT") or (
+            result.verdict == "PASS" and prev_verdict in ("TRADE", "WAIT", None)
+        ):
+            msg = format_pretrade_report(result, snapshot)
+            await send_message(bot, msg)
+        state._last_verdict = result.verdict
+
+        # Auto-execute if TRADE
+        if result.verdict == "TRADE" and result.best_candidate:
+            candidate = result.best_candidate
+            is_half   = (result.confidence == "LOW")
+
+            async with DeltaClient() as ex_client:
+                try:
+                    product_id = await ex_client.get_product_id(candidate.symbol)
+                except Exception as e:
+                    await send_message(bot, format_error("get_product_id", str(e)))
+                    return
+
+                exec_result = await enter_trade(
+                    ex_client, candidate.symbol, candidate.strike,
+                    product_id, candidate.price, is_half_size=is_half,
+                )
+
+            if exec_result.success:
+                state.position_active  = True
+                state.entry_price      = exec_result.fill_price
+                state.entry_symbol     = candidate.symbol
+                state.entry_strike     = candidate.strike
+                state.tp_target        = round(exec_result.fill_price * 0.75)
+                state.sl_target        = round(exec_result.fill_price * 1.20)
+                state.entry_time       = datetime.now(IST)
+                state.entry_contracts  = exec_result.contracts
+                state.entry_product_id = product_id
+                state._last_verdict    = None  # reset for next cycle
+                await send_message(bot, format_auto_entry(exec_result, candidate, snapshot))
+            else:
+                await send_message(bot, format_error("Auto-entry failed", exec_result.error))
 
 
 async def job_monitor_position(bot: Bot):
@@ -348,40 +375,32 @@ async def job_monitor_position(bot: Bot):
     msg = format_monitor_alert(alert, state.entry_symbol, state.entry_strike)
     await send_message(bot, msg)
 
-    # Auto-clear position on TP/SL/HARD_EXIT
+    # Auto-execute exit on TP/SL/HARD_EXIT
     if alert.action in ("EXIT", "HARD_EXIT") and alert.urgency in ("HIGH", "CRITICAL"):
-        state.position_active = False
-        logger.info(f"Position auto-cleared: {alert.action} — {alert.reason}")
+        saved = load_position()
+        product_id = state.entry_product_id or (saved.get("product_id", 0) if saved else 0)
+        contracts  = state.entry_contracts  or (saved.get("contracts",  0) if saved else 0)
 
-
-async def job_noon_signal(bot: Bot):
-    """
-    Fires at exactly 12:00 PM IST.
-    Posts a mechanical trade signal — no checklist gates.
-    Based on backtesting: shorting ATM straddle at 12 PM with 30% TP
-    has 100% trigger rate across all tested days.
-    Skipped if a position is already active or skip_today is set.
-    """
-    if state.skip_today:
-        logger.info("Noon signal skipped — skip_today is set")
-        return
-    if state.position_active:
-        logger.info("Noon signal skipped — position already active")
-        return
-
-    logger.info("Running noon signal")
-    snapshot = await fetch_full_snapshot()
-    if snapshot is None:
-        await send_message(bot, format_error("noon signal", "Failed to fetch data"))
-        return
-
-    result = run_pretrade_checklist(snapshot)
-    if result.verdict == "PASS":
-        logger.info(f"Noon signal sending with caution — checklist PASS: {result.summary}")
-
-    candidate = find_best_strike(snapshot.straddles, snapshot.btc_spot, snapshot.hours_to_expiry)
-    msg = format_noon_signal(snapshot, candidate, checklist_result=result)
-    await send_message(bot, msg)
+        if product_id and contracts:
+            async with DeltaClient() as ex_client:
+                exec_result = await exit_trade(
+                    ex_client, state.entry_symbol, product_id,
+                    contracts, state.entry_price, reason=alert.reason,
+                )
+            state.position_active = False
+            if exec_result.success:
+                await send_message(bot, format_auto_exit(exec_result, alert, state.entry_symbol))
+            else:
+                await send_message(
+                    bot,
+                    format_error("Auto-exit FAILED", exec_result.error)
+                    + "\n⚠️ *Close manually on Delta Exchange\\!*"
+                )
+        else:
+            # No product_id — just clear state (manual position via /entry)
+            state.position_active = False
+            clear_position()
+            logger.info(f"Position cleared (no product_id — manual entry): {alert.action}")
 
 
 # ── Telegram Commands ─────────────────────────────────────────────────────────
@@ -430,21 +449,36 @@ async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = symbol.split("-")
         strike = float(parts[2]) if len(parts) >= 3 else 0.0
 
-        # Set TP/SL — use override if set, else weekend/weekday defaults
+        # Set TP/SL — use override if set, else grid-search optimal defaults
         now_ist = datetime.now(IST)
-        is_weekend = now_ist.weekday() in (5, 6)
         if state.tp_pct_override is not None:
             tp_pct = state.tp_pct_override / 100
         else:
-            tp_pct = 0.30  # default: 30% decay, backtesting-validated
+            tp_pct = 0.25  # 25% decay — grid search optimal
 
-        state.position_active = True
-        state.entry_price = price
-        state.entry_symbol = symbol
-        state.entry_strike = strike
-        state.tp_target = round(price * (1 - tp_pct))
-        state.sl_target = round(price * 1.70)
-        state.entry_time = now_ist
+        state.position_active  = True
+        state.entry_price      = price
+        state.entry_symbol     = symbol
+        state.entry_strike     = strike
+        state.tp_target        = round(price * (1 - tp_pct))
+        state.sl_target        = round(price * 1.20)
+        state.entry_time       = now_ist
+        state.entry_contracts  = 0   # manual — contracts unknown
+        state.entry_product_id = 0   # manual — product_id unknown
+
+        # Persist so monitoring survives a restart
+        save_position({
+            "symbol":      symbol,
+            "strike":      int(strike),
+            "product_id":  0,
+            "entry_price": price,
+            "entry_time":  now_ist.isoformat(),
+            "contracts":   0,
+            "tp_target":   state.tp_target,
+            "sl_target":   state.sl_target,
+            "order_id":    "MANUAL",
+            "paper_trade": False,
+        })
 
         msg = (
             f"✅ Position Logged\n\n"
@@ -469,6 +503,7 @@ async def cmd_exit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     state.position_active = False
+    clear_position()
     await update.message.reply_text(
         f"✅ Position `{state.entry_symbol}` cleared\\. Monitoring stopped\\.",
         parse_mode=ParseMode.MARKDOWN_V2,
@@ -513,6 +548,27 @@ async def cmd_tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except ValueError:
         await update.message.reply_text("❌ Invalid value. Usage: `/tp 30` or `/tp reset`")
+
+
+async def cmd_dryrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle paper trade mode at runtime. Usage: /dryrun on  or  /dryrun off"""
+    import execution_engine as ee
+    args = context.args
+    if not args or args[0].lower() not in ("on", "off"):
+        current = "ON \\(paper\\)" if ee.PAPER_TRADE else "OFF \\(live\\)"
+        await update.message.reply_text(
+            f"Paper trade mode is currently: *{current}*\n\n"
+            f"Usage: `/dryrun on` or `/dryrun off`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    ee.PAPER_TRADE = args[0].lower() == "on"
+    status = "ON \\(paper trade — no real orders\\)" if ee.PAPER_TRADE else "OFF \\(live trading\\)"
+    await update.message.reply_text(
+        f"✅ Paper trade mode: *{status}*",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -560,41 +616,18 @@ async def post_init(application: Application) -> None:
 
     _tz = "Asia/Kolkata"  # use string form — more reliable across APScheduler versions
 
-    # Hourly scan — every hour at :00 (except during entry window)
+    # Unified 24/7 market scan — every SCAN_INTERVAL_MINUTES (default 5)
+    # Hunts all configured tenors (CONTRACT_TENORS), auto-executes when TRADE fires
     scheduler.add_job(
-        job_hourly_scan,
-        CronTrigger(minute=0, timezone=_tz),
+        job_scan,
+        IntervalTrigger(minutes=SCAN_INTERVAL_MINUTES, timezone=IST),
         args=[bot],
-        id="hourly_scan",
-        name="Hourly market scan",
-        misfire_grace_time=120,
-    )
-
-    # Entry window scans — every 15 minutes, 11 AM – 1 PM IST
-    scheduler.add_job(
-        job_entry_window_scan,
-        CronTrigger(
-            hour=f"{ENTRY_WINDOW_START}-{ENTRY_WINDOW_END - 1}",
-            minute="0,15,30,45",
-            timezone=_tz,
-        ),
-        args=[bot],
-        id="entry_window_scan",
-        name="Entry window scan",
+        id="market_scan",
+        name=f"Market scan every {SCAN_INTERVAL_MINUTES}min",
         misfire_grace_time=60,
     )
 
-    # Noon signal — 12:00 PM IST, mechanical entry (Section A gates still apply)
-    scheduler.add_job(
-        job_noon_signal,
-        CronTrigger(hour=12, minute=0, timezone=_tz),
-        args=[bot],
-        id="noon_signal",
-        name="Noon trade signal",
-        misfire_grace_time=120,
-    )
-
-    # Position monitor — every N minutes all day
+    # Position monitor — every MONITOR_INTERVAL_MINUTES (default 10) while in a trade
     scheduler.add_job(
         job_monitor_position,
         IntervalTrigger(minutes=MONITOR_INTERVAL_MINUTES, timezone=IST),
@@ -606,6 +639,27 @@ async def post_init(application: Application) -> None:
 
     scheduler.start()
     logger.info("Scheduler started")
+
+    # Restore position state from disk (handles restarts / redeployments)
+    saved = load_position()
+    if saved:
+        state.position_active   = True
+        state.entry_price       = saved["entry_price"]
+        state.entry_symbol      = saved["symbol"]
+        state.entry_strike      = float(saved.get("strike", 0))
+        state.tp_target         = saved["tp_target"]
+        state.sl_target         = saved["sl_target"]
+        state.entry_time        = datetime.fromisoformat(saved["entry_time"])
+        state.entry_contracts   = saved.get("contracts", 0)
+        state.entry_product_id  = saved.get("product_id", 0)
+        paper_tag = " \\[PAPER\\]" if saved.get("paper_trade") else ""
+        await send_message(
+            bot,
+            f"♻️ *Recovered open position from state file*{paper_tag}\n"
+            f"`{saved['symbol']}` @ \\${saved['entry_price']:,.0f}\n"
+            f"TP: \\${saved['tp_target']:,.0f}  \\|  SL: \\${saved['sl_target']:,.0f}"
+        )
+        logger.info(f"Recovered position: {saved['symbol']} @ {saved['entry_price']}")
 
     # Post startup message to channel
     await send_message(bot, format_startup_message())
@@ -630,6 +684,7 @@ def main():
     app.add_handler(CommandHandler("tp", cmd_tp))
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("dryrun", cmd_dryrun))
 
     logger.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
