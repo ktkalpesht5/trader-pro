@@ -257,38 +257,40 @@ class DeltaClient:
         result = []
         tasks = []
 
+        # Limit concurrency to 20 simultaneous requests — prevents API throttling
+        sem = asyncio.Semaphore(20)
+
         async def fetch_option(product):
             symbol = product["symbol"]
-            try:
-                ticker_data = await self._get(f"/v2/tickers/{symbol}")
-                ticker = ticker_data.get("result", {})
-                contract_type = product.get("contract_type", "")
-
-                # Parse strike — always at index 2: C-BTC-71000-260326 → parts[2] = "71000"
-                parts = symbol.split("-")
+            async with sem:
                 try:
-                    strike = int(parts[2]) if len(parts) >= 4 else 0
-                except (ValueError, IndexError):
-                    strike = 0
+                    ticker_data = await self._get(f"/v2/tickers/{symbol}")
+                    ticker = ticker_data.get("result", {})
+                    contract_type = product.get("contract_type", "")
 
-                mark_price = float(ticker.get("mark_price", 0) or 0)
-                oi = float(ticker.get("oi", 0) or 0)
-                oi_value = float(ticker.get("oi_value", 0) or 0)
-                if oi_value == 0 and oi > 0 and mark_price > 0:
-                    oi_value = oi * mark_price
-                return {
-                    "symbol": symbol,
-                    "strike": strike,
-                    "type": "call" if "call" in contract_type.lower() or symbol.startswith("C-") else "put",
-                    "oi": oi,
-                    "oi_value": oi_value,
-                    "mark_price": mark_price,
-                    "volume": float(ticker.get("volume_24h", None) or ticker.get("volume", 0) or 0),
-                }
-            except Exception:
-                return None
+                    parts = symbol.split("-")
+                    try:
+                        strike = int(parts[2]) if len(parts) >= 4 else 0
+                    except (ValueError, IndexError):
+                        strike = 0
 
-        # Run concurrently to avoid slowness
+                    mark_price = float(ticker.get("mark_price", 0) or 0)
+                    oi = float(ticker.get("oi", 0) or 0)
+                    oi_value = float(ticker.get("oi_value", 0) or 0)
+                    if oi_value == 0 and oi > 0 and mark_price > 0:
+                        oi_value = oi * mark_price
+                    return {
+                        "symbol": symbol,
+                        "strike": strike,
+                        "type": "call" if "call" in contract_type.lower() or symbol.startswith("C-") else "put",
+                        "oi": oi,
+                        "oi_value": oi_value,
+                        "mark_price": mark_price,
+                        "volume": float(ticker.get("volume_24h", None) or ticker.get("volume", 0) or 0),
+                    }
+                except Exception:
+                    return None
+
         tasks = [fetch_option(p) for p in today_options]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

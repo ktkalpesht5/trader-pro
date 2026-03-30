@@ -117,8 +117,19 @@ state = BotState()
 async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
     """
     Fetches all required market data and assembles a MarketSnapshot.
-    Returns None if critical data is unavailable.
+    Returns None if critical data is unavailable or fetch exceeds 45 seconds.
     """
+    try:
+        return await asyncio.wait_for(_fetch_snapshot_inner(), timeout=45.0)
+    except asyncio.TimeoutError:
+        logger.error("fetch_full_snapshot timed out after 45s")
+        return None
+    except Exception as e:
+        logger.error(f"fetch_full_snapshot failed: {e}", exc_info=True)
+        return None
+
+
+async def _fetch_snapshot_inner() -> Optional[MarketSnapshot]:
     try:
         async with DeltaClient() as client:
             # Fetch straddles first so we can align options chain to same expiry date
@@ -237,11 +248,15 @@ async def fetch_full_snapshot() -> Optional[MarketSnapshot]:
         return snapshot
 
     except Exception as e:
-        logger.error(f"fetch_full_snapshot failed: {e}", exc_info=True)
+        logger.error(f"_fetch_snapshot_inner failed: {e}", exc_info=True)
         return None
 
 
 # ── Telegram Sender ───────────────────────────────────────────────────────────
+
+def _strip_markdown(text: str) -> str:
+    return text.replace("\\", "").replace("*", "").replace("`", "").replace("_", "")
+
 
 async def send_message(bot: Bot, text: str):
     """Posts to the configured channel with MarkdownV2 formatting."""
@@ -252,13 +267,23 @@ async def send_message(bot: Bot, text: str):
             parse_mode=ParseMode.MARKDOWN_V2,
         )
     except Exception as e:
-        logger.error(f"Failed to send Telegram message: {e}")
-        # Try plain text fallback
+        logger.error(f"Failed to send Telegram message (MarkdownV2): {e}")
         try:
-            plain = text.replace("\\", "").replace("*", "").replace("`", "")
-            await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=plain)
+            await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=_strip_markdown(text))
         except Exception as e2:
             logger.error(f"Plain text fallback also failed: {e2}")
+
+
+async def reply_formatted(message, text: str):
+    """Reply to a command message with MarkdownV2 + plain text fallback."""
+    try:
+        await message.reply_text(text, parse_mode=ParseMode.MARKDOWN_V2)
+    except Exception as e:
+        logger.error(f"reply_text MarkdownV2 failed: {e}")
+        try:
+            await message.reply_text(_strip_markdown(text))
+        except Exception as e2:
+            logger.error(f"reply_text plain fallback also failed: {e2}")
 
 
 # ── Scheduled Jobs ────────────────────────────────────────────────────────────
@@ -484,10 +509,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to fetch market data. Try again.")
         return
     checklist_result = run_pretrade_checklist(snapshot)
-    await update.message.reply_text(
-        format_hourly_snapshot(snapshot, checklist_result),
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    await reply_formatted(update.message, format_hourly_snapshot(snapshot, checklist_result))
 
 
 async def cmd_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,11 +679,10 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Running checklist... ⏳")
     snapshot = await fetch_full_snapshot()
     if snapshot is None:
-        await update.message.reply_text("❌ Failed to fetch market data.")
+        await update.message.reply_text("❌ Failed to fetch market data. Check Render logs.")
         return
     result = run_pretrade_checklist(snapshot)
-    msg = format_pretrade_report(result, snapshot)
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+    await reply_formatted(update.message, format_pretrade_report(result, snapshot))
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
