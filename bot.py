@@ -159,7 +159,6 @@ async def _fetch_snapshot_inner() -> Optional[MarketSnapshot]:
                 return_exceptions=True,
             )
 
-
         # hours_to_expiry: use the soonest-expiry straddle's value, or 0 if none
         hours_to_expiry = straddles[0]["hours_to_expiry"] if straddles else 0.0
 
