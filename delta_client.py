@@ -166,11 +166,13 @@ class DeltaClient:
                 parts = symbol.split("-")
                 strike = int(parts[2]) if len(parts) >= 3 else 0
 
+                mark_price = float(ticker.get("mark_price", 0) or 0)
+                vol_contracts = float(ticker.get("volume", 0) or ticker.get("volume_24h", 0) or 0)
                 result.append({
                     "symbol": symbol,
                     "strike": strike,
-                    "mark_price": float(ticker.get("mark_price", 0) or 0),
-                    "volume_24h": float(ticker.get("volume_24h", None) or ticker.get("volume", 0) or 0),
+                    "mark_price": mark_price,
+                    "volume_24h": vol_contracts * mark_price,
                     "oi": float(ticker.get("oi", 0) or 0),
                     "greeks": {
                         "delta": float(ticker.get("greeks", {}).get("delta", 0) or 0),
@@ -435,13 +437,14 @@ class DeltaClient:
                 ticker = ticker_data.get("result", {})
                 parts = symbol.split("-")
                 strike = int(parts[2]) if len(parts) >= 3 else 0
+                mark_price = float(ticker.get("mark_price", 0) or 0)
+                # volume from Delta API is in contracts — multiply by mark_price for USD
+                vol_contracts = float(ticker.get("volume", 0) or ticker.get("volume_24h", 0) or 0)
                 result.append({
                     "symbol": symbol,
                     "strike": strike,
-                    "mark_price": float(ticker.get("mark_price", 0) or 0),
-                    "volume_24h": float(
-                        ticker.get("volume_24h") or ticker.get("volume") or 0
-                    ),
+                    "mark_price": mark_price,
+                    "volume_24h": vol_contracts * mark_price,
                     "oi": float(ticker.get("oi", 0) or 0),
                     "greeks": {
                         "delta": float(ticker.get("greeks", {}).get("delta", 0) or 0),

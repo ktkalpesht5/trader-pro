@@ -18,6 +18,7 @@ from typing import Optional
 import pytz
 from dotenv import load_dotenv
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram import Update, Bot
 from telegram.ext import (
@@ -333,6 +334,45 @@ async def job_scan(bot: Bot):
                 await send_message(bot, format_error("Auto-entry failed", exec_result.error))
 
 
+async def job_hourly_snapshot(bot: Bot):
+    """
+    Posts a market snapshot every hour on the :00.
+    Skips during entry window (11 AM–1 PM) — job_entry_window_scan covers that.
+    """
+    if state.skip_today:
+        return
+    now_ist = datetime.now(IST)
+    if ENTRY_WINDOW_START <= now_ist.hour < ENTRY_WINDOW_END:
+        return  # entry window job handles this slot
+    snapshot = await fetch_full_snapshot()
+    if snapshot is None:
+        return
+    state.last_snapshot = snapshot
+    checklist_result = run_pretrade_checklist(snapshot)
+    await send_message(bot, format_hourly_snapshot(snapshot, checklist_result))
+
+
+async def job_entry_window_scan(bot: Bot):
+    """
+    Runs every 15 min during the entry window (11 AM–1 PM IST).
+    Always posts the full pre-trade checklist so the trader sees market conditions
+    at a glance every 15 minutes — including the noon signal at 12:00 PM.
+    Auto-execution is handled by job_scan (5-min); this job is messaging-only.
+    """
+    if state.skip_today or state.position_active:
+        return
+    now_ist = datetime.now(IST)
+    if not (ENTRY_WINDOW_START <= now_ist.hour < ENTRY_WINDOW_END):
+        return
+    snapshot = await fetch_full_snapshot()
+    if snapshot is None:
+        return
+    state.last_snapshot = snapshot
+    result = run_pretrade_checklist(snapshot)
+    state._last_verdict = result.verdict  # keep 24/7 scanner in sync
+    await send_message(bot, format_pretrade_report(result, snapshot))
+
+
 async def job_monitor_position(bot: Bot):
     """
     Runs every 10 minutes while a position is active.
@@ -639,8 +679,8 @@ async def post_init(application: Application) -> None:
 
     _tz = "Asia/Kolkata"  # use string form — more reliable across APScheduler versions
 
-    # Unified 24/7 market scan — every SCAN_INTERVAL_MINUTES (default 5)
-    # Hunts all configured tenors (CONTRACT_TENORS), auto-executes when TRADE fires
+    # 24/7 silent scan — every SCAN_INTERVAL_MINUTES (default 5)
+    # Posts only on TRADE/WAIT verdict; handles auto-execution
     scheduler.add_job(
         job_scan,
         IntervalTrigger(minutes=SCAN_INTERVAL_MINUTES, timezone=IST),
@@ -650,7 +690,28 @@ async def post_init(application: Application) -> None:
         misfire_grace_time=60,
     )
 
-    # Position monitor — every MONITOR_INTERVAL_MINUTES (default 10) while in a trade
+    # Hourly snapshot — every :00, skips during 11 AM–1 PM entry window
+    scheduler.add_job(
+        job_hourly_snapshot,
+        CronTrigger(minute=0, timezone=IST),
+        args=[bot],
+        id="hourly_snapshot",
+        name="Hourly market snapshot",
+        misfire_grace_time=120,
+    )
+
+    # Entry window checklist — every 15 min, 11 AM–12:45 PM IST
+    # Covers the noon signal (12:00 PM fires as part of this cadence)
+    scheduler.add_job(
+        job_entry_window_scan,
+        CronTrigger(hour="11,12", minute="0,15,30,45", timezone=IST),
+        args=[bot],
+        id="entry_window_scan",
+        name="Entry window pre-trade scan (15 min)",
+        misfire_grace_time=60,
+    )
+
+    # Position monitor — every MONITOR_INTERVAL_MINUTES (default 1) while in a trade
     scheduler.add_job(
         job_monitor_position,
         IntervalTrigger(minutes=MONITOR_INTERVAL_MINUTES, timezone=IST),
