@@ -65,8 +65,9 @@ IST = pytz.timezone("Asia/Kolkata")
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]
-ENTRY_WINDOW_START = int(os.getenv("ENTRY_WINDOW_START", "11"))   # kept for manual /check display
-ENTRY_WINDOW_END = int(os.getenv("ENTRY_WINDOW_END", "13"))
+ENTRY_WINDOW_START        = int(os.getenv("ENTRY_WINDOW_START", "8"))    # 8 AM IST (entry from 8:30)
+ENTRY_WINDOW_START_MINUTE = int(os.getenv("ENTRY_WINDOW_START_MINUTE", "30"))  # :30 start
+ENTRY_WINDOW_END          = int(os.getenv("ENTRY_WINDOW_END", "11"))    # 11 AM IST
 MONITOR_INTERVAL_MINUTES = int(os.getenv("MONITOR_INTERVAL_MINUTES", "1"))
 HARD_EXIT_HOUR = int(os.getenv("HARD_EXIT_HOUR", "16"))
 HARD_EXIT_MINUTE = int(os.getenv("HARD_EXIT_MINUTE", "30"))
@@ -362,12 +363,18 @@ async def job_scan(bot: Bot):
 async def job_hourly_snapshot(bot: Bot):
     """
     Posts a market snapshot every hour on the :00.
-    Skips during entry window (11 AM–1 PM) — job_entry_window_scan covers that.
+    Skips during entry window (8:30 AM–11 AM) — job_entry_window_scan covers that.
     """
     if state.skip_today:
         return
     now_ist = datetime.now(IST)
-    if ENTRY_WINDOW_START <= now_ist.hour < ENTRY_WINDOW_END:
+    # Skip if inside entry window (8:30 AM onward up to ENTRY_WINDOW_END)
+    in_entry_window = (
+        (now_ist.hour > ENTRY_WINDOW_START or
+         (now_ist.hour == ENTRY_WINDOW_START and now_ist.minute >= ENTRY_WINDOW_START_MINUTE))
+        and now_ist.hour < ENTRY_WINDOW_END
+    )
+    if in_entry_window:
         return  # entry window job handles this slot
     snapshot = await fetch_full_snapshot()
     if snapshot is None:
@@ -379,15 +386,20 @@ async def job_hourly_snapshot(bot: Bot):
 
 async def job_entry_window_scan(bot: Bot):
     """
-    Runs every 15 min during the entry window (11 AM–1 PM IST).
+    Runs every 15 min during the entry window (8:30 AM–11 AM IST).
     Always posts the full pre-trade checklist so the trader sees market conditions
-    at a glance every 15 minutes — including the noon signal at 12:00 PM.
+    at a glance every 15 minutes.
     Auto-execution is handled by job_scan (5-min); this job is messaging-only.
     """
     if state.skip_today or state.position_active:
         return
     now_ist = datetime.now(IST)
-    if not (ENTRY_WINDOW_START <= now_ist.hour < ENTRY_WINDOW_END):
+    in_window = (
+        (now_ist.hour > ENTRY_WINDOW_START or
+         (now_ist.hour == ENTRY_WINDOW_START and now_ist.minute >= ENTRY_WINDOW_START_MINUTE))
+        and now_ist.hour < ENTRY_WINDOW_END
+    )
+    if not in_window:
         return
     snapshot = await fetch_full_snapshot()
     if snapshot is None:
@@ -711,7 +723,7 @@ async def post_init(application: Application) -> None:
         misfire_grace_time=60,
     )
 
-    # Hourly snapshot — every :00, skips during 11 AM–1 PM entry window
+    # Hourly snapshot — every :00, skips during 8:30 AM–11 AM entry window
     scheduler.add_job(
         job_hourly_snapshot,
         CronTrigger(minute=0, timezone=IST),
@@ -721,14 +733,14 @@ async def post_init(application: Application) -> None:
         misfire_grace_time=120,
     )
 
-    # Entry window checklist — every 15 min, 11 AM–12:45 PM IST
-    # Covers the noon signal (12:00 PM fires as part of this cadence)
+    # Entry window checklist — every 15 min, 8:30 AM–10:45 AM IST
+    # Job function itself enforces the 8:30 start; CronTrigger covers 8–10
     scheduler.add_job(
         job_entry_window_scan,
-        CronTrigger(hour="11,12", minute="0,15,30,45", timezone=IST),
+        CronTrigger(hour="8,9,10", minute="0,15,30,45", timezone=IST),
         args=[bot],
         id="entry_window_scan",
-        name="Entry window pre-trade scan (15 min)",
+        name="Entry window pre-trade scan (15 min, 8:30–11 AM)",
         misfire_grace_time=60,
     )
 

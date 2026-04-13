@@ -109,9 +109,9 @@ def format_hourly_snapshot(snapshot: MarketSnapshot, checklist_result=None) -> s
         ]
 
     if 0 < hours < 6:
-        lines += ["", "⚡ Entry window opens soon — next scan at 11 AM"]
-    elif hours < 10:
-        lines.append("\n🔔 Entry window opens at 11 AM IST")
+        lines += ["", "⚡ Entry window opens soon — next scan at 8:30 AM"]
+    elif hours < 14:
+        lines.append("\n🔔 Entry window opens at 8:30 AM IST")
 
     return "\n".join(lines)
 
@@ -345,7 +345,7 @@ def format_skip_notification(reason: str) -> str:
         f"🚫 *Skip Day* — {_escape(now)}\n"
         f"\n"
         f"No trading today: {_escape(reason)}\n"
-        f"Next assessment tomorrow at 11 AM IST\\."
+        f"Next assessment tomorrow at 8:30 AM IST\\."
     )
 
 

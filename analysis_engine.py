@@ -60,8 +60,8 @@ PARTIAL_PROFIT_DECAY = 0.35  # 35%+ decay after 3 PM → consider partial
 HARD_EXIT_HOUR = 16         # 4 PM IST hard exit hour
 HARD_EXIT_MINUTE = 30       # 4:30 PM IST hard exit
 
-ENTRY_WINDOW_START = 11     # 11 AM IST
-ENTRY_WINDOW_END = 13       # 1 PM IST (exclusive)
+ENTRY_WINDOW_START = 8      # 8 AM IST (entry window opens at 8:30 AM)
+ENTRY_WINDOW_END = 11       # 11 AM IST (exclusive)
 
 
 # ── Data Structures ──────────────────────────────────────────────────────────
