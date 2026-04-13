@@ -576,12 +576,12 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
         )
         return result
 
-    # Scoring: 6+/8 = TRADE, 5/8 = TRADE half-size, <5 = WAIT
+    # Scoring: 4+/8 = TRADE, 3/8 = TRADE half-size, <3 = WAIT
     # All 8 checks count (soft checks B2/B5/B7 count toward score but also add risk points)
-    if result.section_b_pass >= 6:
+    if result.section_b_pass >= 4:
         result.verdict = "TRADE"
-        result.confidence = "HIGH" if result.section_b_pass >= 7 else "MEDIUM"
-    elif result.section_b_pass == 5:
+        result.confidence = "HIGH" if result.section_b_pass >= 6 else "MEDIUM"
+    elif result.section_b_pass == 3:
         result.verdict = "TRADE"
         result.confidence = "LOW"  # half size
     else:
@@ -611,7 +611,7 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
         soft_fails.append(f"B7(${snapshot.btc_4h_move:.0f})")
 
     emoji = "✅" if result.verdict == "TRADE" else "⏳"
-    size_note = " — HALF SIZE" if result.section_b_pass == 5 else ""
+    size_note = " — HALF SIZE" if result.section_b_pass == 3 else ""
     soft_note = f" | Soft fails: {', '.join(soft_fails)}" if soft_fails else ""
     result.summary = (
         f"{emoji} {result.verdict} [{result.confidence}]{size_note}\n"
