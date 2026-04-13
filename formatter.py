@@ -101,11 +101,13 @@ def format_hourly_snapshot(snapshot: MarketSnapshot, checklist_result=None) -> s
     if checklist_result:
         r = checklist_result
         verdict_emoji = {"TRADE": "✅", "WAIT": "⏳", "PASS": "🚫"}.get(r.verdict, "❓")
+        risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(r.risk_label, "⚪")
         lines += [
             "",
             f"📋 Checklist: A {r.section_a_pass}/{r.section_a_total}  \\|  "
             f"B {r.section_b_pass}/{r.section_b_total}  →  "
-            f"*{r.verdict}* {verdict_emoji}",
+            f"*{r.verdict}* {verdict_emoji}  \\|  "
+            f"Risk: {risk_emoji} *{_escape(r.risk_label)}* \\({r.risk_score}\\)",
         ]
 
     if 0 < hours < 6:
@@ -145,6 +147,20 @@ def format_pretrade_report(result: ChecklistResult, snapshot: MarketSnapshot) ->
         icon = "✅" if passed else "❌"
         lines.append(f"{icon} {_escape(name)}")
         lines.append(f"   `{_escape(detail)}`")
+
+    # ── Risk score block ──────────────────────────────────────────────────────
+    risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(result.risk_label, "⚪")
+    risk_desc = {
+        "LOW":    "Conditions within normal range",
+        "MEDIUM": "Elevated risk — size down or monitor closely",
+        "HIGH":   "High risk — consider skipping or paper-trade only",
+    }.get(result.risk_label, "")
+    lines += [
+        "",
+        f"━━━ *Risk Score* ━━━",
+        f"{risk_emoji} *{_escape(result.risk_label)}* — {result.risk_score}/100",
+        f"_{_escape(risk_desc)}_",
+    ]
 
     iv_rv_label = (
         "🟢 Seller edge" if snapshot.iv_rv_spread > 15 else
@@ -372,15 +388,15 @@ def format_startup_message() -> str:
     )
 
 
-def format_auto_entry(result, candidate, snapshot: MarketSnapshot) -> str:
+def format_auto_entry(result, candidate, snapshot: MarketSnapshot, checklist_result=None) -> str:
     """
     Posted when the bot autonomously enters a trade.
     result: ExecutionResult  candidate: StraddleCandidate
+    checklist_result: optional ChecklistResult — adds risk score line
     """
     from execution_engine import PAPER_TRADE
     now    = _now_ist_str()
     symbol = candidate.symbol
-    tp_pct = round((1 - result.fill_price / candidate.price) * 0, 0)  # recalc from fill
     # Derive actual TP/SL from fill price using engine constants
     from execution_engine import TP_PCT, SL_MULT
     tp_price = round(result.fill_price * (1 - TP_PCT))
@@ -398,6 +414,14 @@ def format_auto_entry(result, candidate, snapshot: MarketSnapshot) -> str:
         f"θ/hr: *{_ef(candidate.theta_ratio * 100, '.1f')}%*  \\|  "
         f"Vega\\={_ef(candidate.vega, '.2f')}",
     ]
+    if checklist_result:
+        risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴"}.get(checklist_result.risk_label, "⚪")
+        lines += [
+            "",
+            f"Risk: {risk_emoji} *{_escape(checklist_result.risk_label)}* "
+            f"\\({checklist_result.risk_score}/100\\)  \\|  "
+            f"B score: {checklist_result.section_b_pass}/{checklist_result.section_b_total}",
+        ]
     if PAPER_TRADE:
         lines += ["", "_\\[PAPER TRADE\\]_"]
     return "\n".join(lines)

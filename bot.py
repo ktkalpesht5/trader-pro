@@ -355,7 +355,7 @@ async def job_scan(bot: Bot):
                 state.entry_contracts  = exec_result.contracts
                 state.entry_product_id = product_id
                 state._last_verdict    = None  # reset for next cycle
-                await send_message(bot, format_auto_entry(exec_result, candidate, snapshot))
+                await send_message(bot, format_auto_entry(exec_result, candidate, snapshot, result))
             else:
                 await send_message(bot, format_error("Auto-entry failed", exec_result.error))
 

@@ -141,6 +141,10 @@ class ChecklistResult:
     section_b_total: int = 8
     section_b_details: list = field(default_factory=list)
 
+    # Risk score (from soft checks: A1, A2, A3, B2, B5, B7)
+    risk_score: int = 0         # 0-100
+    risk_label: str = "LOW"    # "LOW" | "MEDIUM" | "HIGH"
+
     # Key numbers
     btc_spot: float = 0.0
     max_pain_gap: float = 0.0
@@ -392,30 +396,54 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
 
     # ── Section A (5 structural checks) ─────────────────────────────────────
     a_details = []
+    risk_points = 0  # accumulates across all soft checks
 
-    # A1: Entry window — 4 to 5.5 hours to this straddle's own expiry
+    # A1: Entry window — 4 to 5.5 hours to this straddle's own expiry (SOFT)
     # Uses per-straddle hours_to_expiry so multi-expiry contracts are evaluated correctly
     cand_hours = atm_straddle.hours_to_expiry_val if atm_straddle else snapshot.hours_to_expiry
     a1 = 4.0 <= cand_hours <= 5.5
-    a_details.append(("A1: Entry window (4-5.5hrs)", a1,
+    if not a1:
+        if 3.0 <= cand_hours < 4.0 or 5.5 < cand_hours <= 7.0:
+            risk_points += 5   # slightly outside ideal window
+        elif 1.5 <= cand_hours < 3.0 or 7.0 < cand_hours <= 9.0:
+            risk_points += 15  # moderately outside — decay less favourable
+        else:
+            risk_points += 25  # far outside — theta curve not in sweet spot
+    a_details.append(("A1: Entry window (4-5.5hrs) ⟨soft⟩", a1,
                        f"{cand_hours:.1f}hrs to expiry"))
 
-    # A2: BTC 4hr move < $800
+    # A2: BTC 4hr move < $800 (SOFT)
     a2 = snapshot.btc_4h_move < BTC_4H_MOVE_MAX
-    a_details.append(("A2: BTC 4hr move <$800", a2,
+    if not a2:
+        move = snapshot.btc_4h_move
+        if move < 1200:
+            risk_points += 10  # elevated but manageable
+        elif move < 1800:
+            risk_points += 20  # high directional pressure
+        else:
+            risk_points += 30  # extreme move — short straddle very risky
+    a_details.append(("A2: BTC 4hr move <$800 ⟨soft⟩", a2,
                        f"${snapshot.btc_4h_move:.0f} move in last 4hrs"))
 
-    # A3: 24h BTC range < $2,500
+    # A3: 24h BTC range < $2,500 (SOFT)
     a3 = snapshot.btc_24h_range < BTC_24H_RANGE_MAX
-    a_details.append(("A3: 24h BTC range <$2,500", a3,
+    if not a3:
+        rng = snapshot.btc_24h_range
+        if rng < 3500:
+            risk_points += 10  # slightly volatile day
+        elif rng < 5000:
+            risk_points += 20  # high volatility day
+        else:
+            risk_points += 30  # extreme range — IV likely elevated
+    a_details.append(("A3: 24h BTC range <$2,500 ⟨soft⟩", a3,
                        f"${snapshot.btc_24h_range:.0f} range (H: ${snapshot.btc_24h_high:.0f} L: ${snapshot.btc_24h_low:.0f})"))
 
     # A4: No macro events (manual check, always pass in code)
     a4 = True
     a_details.append(("A4: No macro events", a4, "Manual check — verify"))
 
-    # A5: Valid candidate exists with |delta| < 0.15 in the entry window
-    a5 = atm_straddle is not None and a1
+    # A5: Valid candidate exists with |delta| < 0.15 (HARD GATE)
+    a5 = atm_straddle is not None
     a_details.append(("A5: Valid ATM strike available", a5,
                        f"Best: {atm_straddle.symbol} Δ={atm_straddle.delta:.2f}" if atm_straddle else "No strike with |delta| < 0.15"))
 
@@ -423,47 +451,69 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
     result.section_a_total = len(a_details)
     result.section_a_details = a_details
 
-    # Track Section A hard gate failures (verdict determined at the end)
-    section_a_hard_fail = any([not a1, not a2, not a3]) or not a5
+    # Only A5 is a hard gate now — A1/A2/A3 are soft (risk score contributors)
+    section_a_hard_fail = not a5
 
     # ── Section B (8 quality checks) ────────────────────────────────────────
     b_details = []
     c = atm_straddle
 
     if c is not None:
-        # B1: IV < 55%
+        # B1: IV < 55% (HARD)
         b1 = c.iv < IV_MAX if c.iv > 0 else True
         b_details.append(("B1: IV < 55%", b1, f"IV = {c.iv:.1f}%"))
 
-        # B2: IV-RV spread
+        # B2: IV-RV spread (SOFT — adds risk score)
         b2 = snapshot.iv_rv_spread > IV_RV_CAUTION
-        b_details.append(("B2: IV-RV spread > -10", b2,
+        if not b2:
+            spread = snapshot.iv_rv_spread
+            if spread >= -15:
+                risk_points += 10  # caution zone
+            elif spread >= -25:
+                risk_points += 20  # buyers have clear edge
+            else:
+                risk_points += 30  # extreme IV discount — IV spike risk high
+        b_details.append(("B2: IV-RV spread > -10 ⟨soft⟩", b2,
                            f"IV-RV = {snapshot.iv_rv_spread:+.1f} (IV={snapshot.implied_vol:.0f}% RV={snapshot.realised_vol:.0f}%)"))
 
-        # B3: |Delta| < 0.15
+        # B3: |Delta| < 0.15 (HARD VETO)
         b3 = abs(c.delta) < DELTA_MAX
-        b_details.append(("B3: |Delta| < 0.15", b3, f"Δ = {c.delta:.3f}"))
+        b_details.append(("B3: |Delta| < 0.15 ⟨veto⟩", b3, f"Δ = {c.delta:.3f}"))
 
-        # B4: Theta/Price > 2.5%/hr
+        # B4: Theta/Price > 2.5%/hr (HARD VETO)
         b4 = c.theta_ratio > THETA_RATIO_MIN
-        b_details.append(("B4: Theta/price > 2.5%/hr", b4,
+        b_details.append(("B4: Theta/price > 2.5%/hr ⟨veto⟩", b4,
                            f"{c.theta_ratio * 100:.2f}%/hr (${c.theta_per_hour:.1f}/hr on ${c.price:.0f})"))
 
-        # B5: Vega < 18
+        # B5: Vega < 18 (SOFT — adds risk score)
         b5 = c.vega < VEGA_MAX
-        b_details.append(("B5: Vega < 18", b5, f"Vega = {c.vega:.2f}"))
+        if not b5:
+            vega = c.vega
+            if vega < 25:
+                risk_points += 5   # mild IV spike sensitivity
+            elif vega < 35:
+                risk_points += 15  # meaningful IV spike risk
+            else:
+                risk_points += 25  # high sensitivity — IV move could wipe profit
+        b_details.append(("B5: Vega < 18 ⟨soft⟩", b5, f"Vega = {c.vega:.2f}"))
 
-        # B6: Volume at target strike (want > $1M volume as liquidity signal)
+        # B6: Volume at target strike (want > $1M volume as liquidity signal) (HARD)
         b6 = c.volume_24h > 1_000_000
         b_details.append(("B6: Adequate volume", b6,
                            f"${c.volume_24h / 1e6:.2f}M 24h vol"))
 
-        # B7: BTC flat last 60min (approximated by 4hr move < $400 for this check)
+        # B7: BTC flat last 60min (approximated by 4hr move < $400) (SOFT — adds risk score)
         b7 = snapshot.btc_4h_move < 400
-        b_details.append(("B7: BTC relatively flat", b7,
+        if not b7:
+            move = snapshot.btc_4h_move
+            if move < 600:
+                risk_points += 5   # slightly elevated momentum
+            elif move < 800:
+                risk_points += 10  # BTC moving — gamma risk rising (capped; A2 captures >800)
+        b_details.append(("B7: BTC relatively flat ⟨soft⟩", b7,
                            f"${snapshot.btc_4h_move:.0f} 4hr move"))
 
-        # B8: Max Pain proximity (within $2,000)
+        # B8: Max Pain proximity (within $2,000) (HARD)
         b8 = result.max_pain_gap < MAX_PAIN_BAD_GAP
         pain_dir = "above" if snapshot.max_pain > snapshot.btc_spot else "below"
         b_details.append(("B8: Max Pain within $2,000", b8,
@@ -471,10 +521,11 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
     else:
         # No valid straddle candidate — mark all B checks as N/A
         b3 = b4 = b8 = False
+        b1 = b6 = False
         for label in [
-            "B1: IV < 55%", "B2: IV-RV spread > -10", "B3: |Delta| < 0.15",
-            "B4: Theta/price > 2.5%/hr", "B5: Vega < 18", "B6: Adequate volume",
-            "B7: BTC relatively flat", "B8: Max Pain within $2,000",
+            "B1: IV < 55%", "B2: IV-RV spread > -10 ⟨soft⟩", "B3: |Delta| < 0.15 ⟨veto⟩",
+            "B4: Theta/price > 2.5%/hr ⟨veto⟩", "B5: Vega < 18 ⟨soft⟩", "B6: Adequate volume",
+            "B7: BTC relatively flat ⟨soft⟩", "B8: Max Pain within $2,000",
         ]:
             b_details.append((label, False, "N/A — no valid straddle in chain"))
 
@@ -482,22 +533,24 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
     result.section_b_total = len(b_details)
     result.section_b_details = b_details
 
+    # ── Compute risk score ───────────────────────────────────────────────────
+    risk_points = min(100, risk_points)
+    if risk_points <= 15:
+        risk_label = "LOW"
+    elif risk_points <= 40:
+        risk_label = "MEDIUM"
+    else:
+        risk_label = "HIGH"
+    result.risk_score = risk_points
+    result.risk_label = risk_label
+
     # ── Final Verdict ────────────────────────────────────────────────────────
 
-    # Section A hard gates override everything
+    # A5 hard gate (no neutral delta strike at all)
     if section_a_hard_fail:
-        failures = []
-        if not a1:
-            failures.append(f"time window ({cand_hours:.1f}hrs)")
-        if not a2:
-            failures.append(f"4hr BTC move (${snapshot.btc_4h_move:.0f})")
-        if not a3:
-            failures.append(f"24h range (${snapshot.btc_24h_range:.0f})")
-        if not a5:
-            failures.append("no neutral delta strike")
         result.verdict = "PASS"
         result.confidence = "HIGH"
-        result.summary = f"🚫 Section A hard fail: {', '.join(failures)}"
+        result.summary = "🚫 No valid ATM strike with |delta| < 0.15 found in chain"
         return result
 
     # B3 (delta) and B4 (theta) individually veto
@@ -513,7 +566,7 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
         result.summary = f"🚫 Theta ratio too low ({c.theta_ratio * 100:.2f}%/hr) — not enough decay"
         return result
 
-    # B8 (max pain) is a strong signal
+    # B8 (max pain) is a strong signal — hard gate
     if not b8:
         result.verdict = "PASS"
         result.confidence = "HIGH"
@@ -523,7 +576,8 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
         )
         return result
 
-    # Scoring
+    # Scoring: 6+/8 = TRADE, 5/8 = TRADE half-size, <5 = WAIT
+    # All 8 checks count (soft checks B2/B5/B7 count toward score but also add risk points)
     if result.section_b_pass >= 6:
         result.verdict = "TRADE"
         result.confidence = "HIGH" if result.section_b_pass >= 7 else "MEDIUM"
@@ -541,12 +595,27 @@ def run_pretrade_checklist(snapshot: MarketSnapshot) -> ChecklistResult:
         result.tp_target = round(atm_straddle.price * (1 - tp_pct))
         result.sl_target = round(atm_straddle.price * SL_MULTIPLIER)
 
-    # Summary
+    # Soft-fail context for summary
+    soft_fails = []
+    if not a1:
+        soft_fails.append(f"A1({cand_hours:.1f}hrs)")
+    if not a2:
+        soft_fails.append(f"A2(${snapshot.btc_4h_move:.0f})")
+    if not a3:
+        soft_fails.append(f"A3(${snapshot.btc_24h_range:.0f})")
+    if c and not b2:
+        soft_fails.append(f"B2({snapshot.iv_rv_spread:+.1f})")
+    if c and not b5:
+        soft_fails.append(f"B5({c.vega:.1f})")
+    if c and not b7:
+        soft_fails.append(f"B7(${snapshot.btc_4h_move:.0f})")
+
     emoji = "✅" if result.verdict == "TRADE" else "⏳"
     size_note = " — HALF SIZE" if result.section_b_pass == 5 else ""
+    soft_note = f" | Soft fails: {', '.join(soft_fails)}" if soft_fails else ""
     result.summary = (
         f"{emoji} {result.verdict} [{result.confidence}]{size_note}\n"
-        f"Section B: {result.section_b_pass}/8 | {result.regime}\n"
+        f"Section B: {result.section_b_pass}/8 | Risk: {risk_label} ({risk_points}){soft_note}\n"
         f"Strike: {atm_straddle.symbol if atm_straddle else 'N/A'}"
     )
 
