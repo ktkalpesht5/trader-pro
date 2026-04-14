@@ -21,7 +21,10 @@ import pytz
 logger = logging.getLogger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
-BASE_URL = "https://api.india.delta.exchange"
+BASE_URL   = "https://api.india.delta.exchange"
+# QuotaGuard Static sets this automatically on Render.
+# When present, all outbound REST calls are routed through the static IP.
+_PROXY_URL = os.getenv("QUOTAGUARDSTATIC_URL", "")
 
 
 class DeltaClient:
@@ -39,10 +42,12 @@ class DeltaClient:
         self._product_id_cache: dict[str, int] = {}
 
     async def __aenter__(self):
+        proxy = _PROXY_URL or None
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=15.0,
             headers={"Accept": "application/json"},
+            proxy=proxy,
         )
         return self
 
@@ -501,9 +506,12 @@ class DeltaClient:
         data = await self._auth_get(f"/v2/orders/{order_id}")
         return data.get("result", data)
 
-    async def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open order."""
-        data = await self._auth_delete(f"/v2/orders/{order_id}", {"id": int(order_id)})
+    async def cancel_order(self, order_id: str, product_id: int = 0) -> dict:
+        """Cancel an open order. product_id is required by Delta Exchange India API."""
+        body: dict = {"id": int(order_id)}
+        if product_id:
+            body["product_id"] = product_id
+        data = await self._auth_delete("/v2/orders", body)
         return data.get("result", data)
 
     async def get_position(self, product_id: int) -> dict | None:

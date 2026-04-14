@@ -3,4 +3,10 @@
 __pycache__/
 *.pyc
 *.pyo
+*.json
+*.csv
+*.md
+*.txt
+*.ini
+.env
 .idea/

@@ -31,6 +31,7 @@ from telegram.constants import ParseMode
 from delta_client import DeltaClient
 from state_store import load_position, save_position, clear_position
 from execution_engine import enter_trade, exit_trade, ExecutionResult, PAPER_TRADE
+import trader as _trader
 from analysis_engine import (
     MarketSnapshot,
     run_pretrade_checklist,
@@ -637,6 +638,18 @@ async def cmd_tp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid value. Usage: `/tp 30` or `/tp reset`")
 
 
+async def cmd_skip_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Skip the automated trader for today. Usage: /skip_today FOMC meeting"""
+    reason = " ".join(context.args) if context.args else "manual skip"
+    _trader.skip_today(reason)
+    await update.message.reply_text(f"✅ Automated trader will skip today: {reason}")
+
+
+async def cmd_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the automated trader's current position and trail status."""
+    await update.message.reply_text(_trader.get_position_status())
+
+
 async def cmd_dryrun(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle paper trade mode at runtime. Usage: /dryrun on  or  /dryrun off"""
     import execution_engine as ee
@@ -744,6 +757,16 @@ async def post_init(application: Application) -> None:
         misfire_grace_time=30,
     )
 
+    # Automated trailing-SL trader — fires at 05:45 IST on Mon/Wed/Thu/Sun
+    # The job itself sleeps internally until 06:00 and handles all lifecycle.
+    scheduler.add_job(
+        _trader.run_trade_job,
+        CronTrigger(hour=5, minute=45, day_of_week="mon,wed,thu,sun", timezone=IST),
+        id="auto_trader",
+        name="Automated trailing-SL trader (Mon/Wed/Thu/Sun 06:00 IST)",
+        misfire_grace_time=300,
+    )
+
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -792,6 +815,8 @@ def main():
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("dryrun", cmd_dryrun))
+    app.add_handler(CommandHandler("skip_today", cmd_skip_today))
+    app.add_handler(CommandHandler("position", cmd_position))
 
     logger.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
