@@ -60,7 +60,7 @@ WS_PORT         = 443
 ENTRY_LOTS     = int(os.getenv("TRADE_LOTS", "100"))
 TRAIL_DISTANCE = float(os.getenv("TRAIL_DISTANCE", "150"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHANNEL_ID", "")
+TELEGRAM_CHAT  = os.getenv("AMTRADINGLOGS_CHANNEL_ID", "")
 PAPER_TRADE    = os.getenv("PAPER_TRADE", "false").lower() == "true"
 
 # ── Module-level state (queried by bot.py commands) ───────────────────────────
@@ -315,9 +315,7 @@ async def close_position(product_id: int, symbol: str, contracts: int) -> float:
     Returns confirmed fill price, or 0.0 if all retries exhausted.
     """
     if PAPER_TRADE:
-        async with DeltaClient() as client:
-            data = await client._get(f"/v2/tickers/{symbol}")
-        return float(data.get("result", {}).get("mark_price", 0) or 0)
+        return 0.0  # keep the trigger price set by the monitor; don't overwrite with a fresh fetch
 
     deadline = time.time() + CLOSE_RETRY_LIMIT_S
     attempt  = 0
@@ -394,6 +392,7 @@ class TrailMonitor:
         self._last_update = time.time()
         self._exit_reason: Optional[str] = None
         self._exit_price:  Optional[float] = None
+        self._trail_breach_count = 0   # consecutive readings above trail level required before exit
 
     async def run(self) -> tuple[str, Optional[float]]:
         """Blocks until trail fires, hard exit, or safety close."""
@@ -423,7 +422,15 @@ class TrailMonitor:
 
     # ── Price processing ──────────────────────────────────────────────────────
 
-    async def _process_price(self, price: float) -> None:
+    async def _process_price(self, price: float, trade_price: float = 0.0) -> None:
+        """
+        price       : mark_price from REST ticker or WebSocket
+        trade_price : last traded price from REST ticker (0 if unavailable / WS path)
+
+        Trail exit logic:
+          - Mark + trade price both breach trail level → exit immediately (real move)
+          - Mark price alone breaches → require 2 consecutive readings (spike filter)
+        """
         self._last_update = time.time()
         if price <= 0:
             return
@@ -436,13 +443,32 @@ class TrailMonitor:
         if self.running_min < self.entry_price:
             trail_level = self.running_min + self.trail_dist
             if price >= trail_level:
-                logger.info(
-                    f"TRAIL FIRED: px={price:.2f} >= trail={trail_level:.2f} "
-                    f"(running_min={self.running_min:.2f}, entry={self.entry_price:.2f})"
-                )
-                self._exit_reason = "TRAIL"
-                self._exit_price  = price
-                self._stop.set()
+                trade_confirms = trade_price > 0 and trade_price >= trail_level
+                if trade_confirms:
+                    # Both mark and last-trade price confirm — real move, exit immediately
+                    logger.info(
+                        f"TRAIL CONFIRMED (mark+trade): mark={price:.2f} trade={trade_price:.2f} "
+                        f">= trail={trail_level:.2f} (running_min={self.running_min:.2f})"
+                    )
+                    self._exit_reason = "TRAIL"
+                    self._exit_price  = price
+                    self._stop.set()
+                else:
+                    # Mark price alone — could be a model spike, require a second reading
+                    self._trail_breach_count += 1
+                    logger.info(
+                        f"TRAIL BREACH {self._trail_breach_count}/2: mark={price:.2f} >= trail={trail_level:.2f} "
+                        f"trade={trade_price:.2f} (running_min={self.running_min:.2f})"
+                    )
+                    if self._trail_breach_count >= 2:
+                        logger.info("TRAIL CONFIRMED (2 consecutive mark readings) — exiting")
+                        self._exit_reason = "TRAIL"
+                        self._exit_price  = price
+                        self._stop.set()
+            else:
+                if self._trail_breach_count > 0:
+                    logger.info(f"Trail breach reset (mark fell back to ${price:.2f})")
+                self._trail_breach_count = 0
 
     def _persist(self) -> None:
         try:
@@ -541,10 +567,12 @@ class TrailMonitor:
             try:
                 async with DeltaClient() as client:
                     data = await client._get(f"/v2/tickers/{self.symbol}")
-                price = float(data.get("result", {}).get("mark_price", 0) or 0)
+                ticker      = data.get("result", {})
+                price       = float(ticker.get("mark_price", 0) or 0)
+                trade_price = float(ticker.get("close", 0) or 0)
                 if price > 0:
-                    logger.debug(f"REST fallback price: ${price:.2f}")
-                    await self._process_price(price)
+                    logger.debug(f"REST poll: mark=${price:.2f} trade=${trade_price:.2f}")
+                    await self._process_price(price, trade_price)
             except Exception as e:
                 logger.warning(f"REST fallback error: {e}")
 
