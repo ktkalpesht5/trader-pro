@@ -28,7 +28,7 @@ SL_MULT = 1.20    # 120% of entry       (grid search optimal)
 
 POSITION_CONTRACTS  = int(os.getenv("POSITION_CONTRACTS",  "10"))
 HALF_SIZE_CONTRACTS = int(os.getenv("HALF_SIZE_CONTRACTS", "5"))
-PAPER_TRADE         = os.getenv("PAPER_TRADE", "false").lower() == "true"
+PAPER_TRADE         = os.getenv("EE_PAPER_TRADE", os.getenv("PAPER_TRADE", "true")).lower() == "true"
 ORDER_FILL_TIMEOUT  = 30     # seconds to wait for limit fill before switching to market
 CONTRACT_BTC        = 0.001  # each contract = 0.001 BTC
 
