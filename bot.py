@@ -32,6 +32,7 @@ from delta_client import DeltaClient
 from state_store import load_position, save_position, clear_position
 from execution_engine import enter_trade, exit_trade, ExecutionResult, PAPER_TRADE
 import trader as _trader
+import overnight_trader as _overnight_trader
 from analysis_engine import (
     MarketSnapshot,
     run_pretrade_checklist,
@@ -764,6 +765,18 @@ async def post_init(application: Application) -> None:
         CronTrigger(hour=5, minute=45, day_of_week="mon,wed,thu,sun", timezone=IST),
         id="auto_trader",
         name="Automated trailing-SL trader (Mon/Wed/Thu/Sun 06:00 IST)",
+        misfire_grace_time=300,
+    )
+
+    # Overnight short straddle — fires at 23:50 IST on Mon/Wed/Thu/Fri.
+    # The job sleeps internally until the per-day entry time (00:00 or 00:30 IST
+    # the following morning), then runs the full lifecycle through 05:30 IST.
+    # No timing conflict: daytime trader exits by 16:30 IST; overnight exits by 05:30 IST.
+    scheduler.add_job(
+        _overnight_trader.run_overnight_job,
+        CronTrigger(hour=23, minute=50, day_of_week="mon,wed,thu,fri", timezone=IST),
+        id="overnight_trader",
+        name="Overnight short straddle (Tue/Thu/Fri/Sat 00:00-05:30 IST)",
         misfire_grace_time=300,
     )
 

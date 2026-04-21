@@ -531,6 +531,18 @@ class DeltaClient:
             return None
         return result
 
+    async def get_all_open_positions(self) -> list[dict]:
+        """
+        Returns all positions with a non-zero size on the account.
+        Used by overnight_trader's dynamic close to close everything regardless
+        of which product_id was entered, without relying on local state.
+        """
+        data   = await self._auth_get("/v2/positions")
+        result = data.get("result", [])
+        if not isinstance(result, list):
+            return []
+        return [p for p in result if int(p.get("size", 0)) != 0]
+
     async def get_product_id(self, symbol: str) -> int:
         """
         Returns the integer product_id for a given symbol.
