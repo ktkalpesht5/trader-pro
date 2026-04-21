@@ -7,7 +7,7 @@ Schedule  : Triggered at 23:50 IST on Mon/Wed/Thu/Fri (night before the trade)
 Entry     : 00:00 or 00:30 IST next morning (per-day rule)
 Exit      : 05:30 IST hard exit, or TP/SL hit during hold
 Lots      : 100 (TRADE_LOTS env var)
-Monitoring: REST poll every 2 min — overnight is a theta play
+Monitoring: REST poll every 15s — mark_price + close (last traded) dual confirmation
 Post to   : AMTRADINGLOGS_CHANNEL_ID (same channel as daytime trader)
 
 Per-day rules (night-of → trade-day, entry, TP, SL):
@@ -51,7 +51,7 @@ PAPER_TRADE     = os.getenv("EE_PAPER_TRADE", "false").lower() == "true"
 ENTRY_LOTS      = int(os.getenv("TRADE_LOTS", "100"))
 FILL_TIMEOUT_S  = 60
 CLOSE_RETRY_S   = 300
-POLL_INTERVAL_S = 120    # REST price check every 2 min
+POLL_INTERVAL_S = 15     # REST price check every 15s — matches daytime trader REST_POLL_S
 
 STATE_FILE      = "overnight_position.json"
 _TMP_STATE_FILE = "overnight_position.json.tmp"
@@ -171,6 +171,11 @@ async def _close_all_positions() -> float:
                 logger.info("_close_all_positions: no open positions on exchange")
                 return 0.0
 
+            await _telegram(
+                f"🔄 OVERNIGHT CLOSING — sending market buy for "
+                f"{len(positions)} position(s)"
+            )
+
             last_fill_px = 0.0
             for pos in positions:
                 product_id = int(pos.get("product_id", 0))
@@ -189,6 +194,10 @@ async def _close_all_positions() -> float:
                 order_id = str(order.get("id", ""))
                 if not order_id:
                     logger.error(f"No order ID returned for close of product_id={product_id}")
+                    await _telegram(
+                        f"⚠️ OVERNIGHT CLOSE: no order ID for product_id={product_id} "
+                        f"(size={size}). Retrying..."
+                    )
                     continue
 
                 filled = await _await_fill(order_id)
@@ -197,6 +206,10 @@ async def _close_all_positions() -> float:
                     logger.info(f"Closed product_id={product_id} @ ${last_fill_px:.2f}")
                 else:
                     logger.warning(f"Close order timed out for product_id={product_id}")
+                    await _telegram(
+                        f"⚠️ OVERNIGHT CLOSE TIMEOUT: order {order_id} "
+                        f"(product_id={product_id}) did not fill in {FILL_TIMEOUT_S}s. Retrying..."
+                    )
 
             return last_fill_px
 
@@ -316,11 +329,17 @@ async def _monitor_until_exit(
     hard_exit:   datetime,
 ) -> tuple[str, float]:
     """
-    Poll the straddle mark price every POLL_INTERVAL_S seconds.
+    Poll the straddle price every POLL_INTERVAL_S seconds (15s).
+    Dual-price confirmation — matches daytime trader.py _process_price() pattern:
+      - Fetches mark_price AND close (last traded price) from ticker
+      - Both confirm breach  → exit immediately
+      - mark_price alone     → increment breach counter; exit after 2 consecutive readings
+      - Price retreats       → reset breach counters
     Exit triggers (first to fire wins):
       TP        — price decayed by tp_usd below entry  (price ≤ entry - tp_usd)
       SL        — price expanded by sl_usd above entry (price ≥ entry + sl_usd)
       HARD_EXIT — IST clock reaches hard_exit time
+    Telegram alert posted on each trigger before returning.
     Returns (reason, last_known_price).
     """
     tp_target = entry_price - tp_usd
@@ -332,7 +351,9 @@ async def _monitor_until_exit(
         f"hard_exit={hard_exit.strftime('%H:%M IST')}"
     )
 
-    last_price = entry_price
+    last_price      = entry_price
+    tp_breach_count = 0
+    sl_breach_count = 0
 
     while True:
         now = _now_ist()
@@ -340,36 +361,96 @@ async def _monitor_until_exit(
         # Hard exit check first — unconditional
         if now >= hard_exit:
             logger.info(f"Hard exit triggered at {now.strftime('%H:%M:%S IST')}")
+            await _telegram(
+                f"⏰ HARD EXIT {hard_exit.strftime('%H:%M IST')} — {symbol}\n"
+                f"Last price: ${last_price:.2f}\n"
+                f"Closing position..."
+            )
             return "HARD_EXIT", last_price
 
-        # Fetch current mark price
+        # Fetch mark_price + close (last traded) from ticker
+        mark_price  = 0.0
+        trade_price = 0.0
         try:
             async with DeltaClient() as client:
                 data = await client._get(f"/v2/tickers/{symbol}")
-            price = float(data.get("result", {}).get("mark_price", 0) or 0)
-            if price > 0:
-                last_price = price
+            ticker      = data.get("result", {})
+            mark_price  = float(ticker.get("mark_price", 0) or 0)
+            trade_price = float(ticker.get("close", 0) or 0)   # last traded price
+            if mark_price > 0:
+                last_price = mark_price
         except Exception as e:
             logger.warning(f"Price poll error: {e}")
-            price = 0
 
-        if price > 0:
+        if mark_price > 0:
             logger.debug(
-                f"Poll: {symbol} mark=${price:.2f}  "
+                f"Poll: {symbol} mark=${mark_price:.2f}  trade=${trade_price:.2f}  "
                 f"(TP≤${tp_target:.2f}  SL≥${sl_target:.2f})"
             )
 
-            if price <= tp_target:
-                logger.info(f"TP hit: ${price:.2f} ≤ ${tp_target:.2f}")
-                return "TP", price
+            # ── TP check ─────────────────────────────────────────────────────
+            tp_mark  = mark_price  <= tp_target
+            tp_trade = trade_price <= tp_target and trade_price > 0
 
-            if price >= sl_target:
-                logger.info(f"SL hit: ${price:.2f} ≥ ${sl_target:.2f}")
-                return "SL", price
+            if tp_mark and tp_trade:
+                # Both prices confirm — exit immediately
+                logger.info(f"TP hit (dual): mark=${mark_price:.2f}  trade=${trade_price:.2f} ≤ ${tp_target:.2f}")
+                await _telegram(
+                    f"🎯 TP HIT — {symbol}\n"
+                    f"Mark:  ${mark_price:.2f}  Trade: ${trade_price:.2f}\n"
+                    f"TP target: ≤${tp_target:.2f}\n"
+                    f"Closing position..."
+                )
+                return "TP", mark_price
+            elif tp_mark:
+                # Only mark confirms — require 2 consecutive readings
+                tp_breach_count += 1
+                logger.info(f"TP mark-only breach #{tp_breach_count}: mark=${mark_price:.2f} ≤ ${tp_target:.2f}")
+                if tp_breach_count >= 2:
+                    logger.info(f"TP confirmed after {tp_breach_count} consecutive mark breaches")
+                    await _telegram(
+                        f"🎯 TP HIT (confirmed) — {symbol}\n"
+                        f"Mark:  ${mark_price:.2f} ≤ TP ${tp_target:.2f}\n"
+                        f"({tp_breach_count} consecutive readings)\n"
+                        f"Closing position..."
+                    )
+                    return "TP", mark_price
+            else:
+                tp_breach_count = 0   # price retreated — reset
+
+            # ── SL check ─────────────────────────────────────────────────────
+            sl_mark  = mark_price  >= sl_target
+            sl_trade = trade_price >= sl_target and trade_price > 0
+
+            if sl_mark and sl_trade:
+                # Both prices confirm — exit immediately
+                logger.info(f"SL hit (dual): mark=${mark_price:.2f}  trade=${trade_price:.2f} ≥ ${sl_target:.2f}")
+                await _telegram(
+                    f"🛑 SL HIT — {symbol}\n"
+                    f"Mark:  ${mark_price:.2f}  Trade: ${trade_price:.2f}\n"
+                    f"SL target: ≥${sl_target:.2f}\n"
+                    f"Closing position..."
+                )
+                return "SL", mark_price
+            elif sl_mark:
+                # Only mark confirms — require 2 consecutive readings
+                sl_breach_count += 1
+                logger.info(f"SL mark-only breach #{sl_breach_count}: mark=${mark_price:.2f} ≥ ${sl_target:.2f}")
+                if sl_breach_count >= 2:
+                    logger.info(f"SL confirmed after {sl_breach_count} consecutive mark breaches")
+                    await _telegram(
+                        f"🛑 SL HIT (confirmed) — {symbol}\n"
+                        f"Mark:  ${mark_price:.2f} ≥ SL ${sl_target:.2f}\n"
+                        f"({sl_breach_count} consecutive readings)\n"
+                        f"Closing position..."
+                    )
+                    return "SL", mark_price
+            else:
+                sl_breach_count = 0   # price retreated — reset
 
         # Sleep until next poll, but cap at time remaining to hard exit
         secs_to_exit = max(0.0, (hard_exit - _now_ist()).total_seconds())
-        await asyncio.sleep(min(POLL_INTERVAL_S, max(5.0, secs_to_exit)))
+        await asyncio.sleep(min(POLL_INTERVAL_S, max(1.0, secs_to_exit)))
 
 
 # ── Trade finalization ─────────────────────────────────────────────────────────
